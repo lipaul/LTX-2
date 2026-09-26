@@ -155,11 +155,46 @@ def _slab_qkv(  # noqa: PLR0913
     eps = 1e-6
     head_shape = (batch, t, h, ext_w, num_heads, head_dim)
     q = F.linear(y, q_w, q_b).view(head_shape)
-    q = F.rms_norm(q, (head_dim,), q_norm_w, eps) * attn_scale
-    q = _apply_in_slab_abs_rope(q, rope_split, inv_freqs, w_pos, compute_dtype=rope_dtype, t_pos=t_pos)
-    k = F.linear(y, k_w, k_b).view(head_shape)
-    k = F.rms_norm(k, (head_dim,), k_norm_w, eps)
-    k = _apply_in_slab_abs_rope(k, rope_split, inv_freqs, w_pos, compute_dtype=rope_dtype, t_pos=t_pos)
+    from ltx_core.model.video_vae.transformer.r26_vae import r26_norm_rope, r26_on  # noqa: PLC0415
+
+    if t_pos is None and rope_dtype == torch.float32 and r26_on():
+        k = F.linear(y, k_w, k_b).view(head_shape)
+        fused_qk = r26_norm_rope(
+            q,
+            k,
+            q_norm_w,
+            k_norm_w,
+            inv_freqs[0],
+            inv_freqs[1],
+            inv_freqs[2],
+            w_pos,
+            rope_split[0],
+            rope_split[1],
+            eps,
+            attn_scale,
+            1.0,
+        )
+        if fused_qk is not None:
+            q, k = fused_qk
+        else:
+            q = F.rms_norm(q, (head_dim,), q_norm_w, eps) * attn_scale
+            q = _apply_in_slab_abs_rope(
+                q, rope_split, inv_freqs, w_pos, compute_dtype=rope_dtype, t_pos=t_pos
+            )
+            k = F.rms_norm(k, (head_dim,), k_norm_w, eps)
+            k = _apply_in_slab_abs_rope(
+                k, rope_split, inv_freqs, w_pos, compute_dtype=rope_dtype, t_pos=t_pos
+            )
+    else:
+        q = F.rms_norm(q, (head_dim,), q_norm_w, eps) * attn_scale
+        q = _apply_in_slab_abs_rope(
+            q, rope_split, inv_freqs, w_pos, compute_dtype=rope_dtype, t_pos=t_pos
+        )
+        k = F.linear(y, k_w, k_b).view(head_shape)
+        k = F.rms_norm(k, (head_dim,), k_norm_w, eps)
+        k = _apply_in_slab_abs_rope(
+            k, rope_split, inv_freqs, w_pos, compute_dtype=rope_dtype, t_pos=t_pos
+        )
     v = F.linear(y, v_w, v_b).view(head_shape)
     return q, k, v
 
@@ -208,8 +243,32 @@ def _attn_on_chunk_impl(  # noqa: PLR0913
     inv_freqs = (inv_t, inv_h, inv_w)
     rope_split = (d_t, d_h, d_w)
 
-    y = F.rms_norm(x_chunk, (dim,), norm_weight, 1e-6)
-    y = y * (1.0 + scale) + shift
+    if x_chunk.is_xpu:
+        from ltx_core.model.transformer.r8_sycl import r17_mlp_norm_affine  # noqa: PLC0415
+        from ltx_core.model.video_vae.transformer.r26_vae import r26_norm_affine, r26_on  # noqa: PLC0415
+
+        y = torch.empty_like(x_chunk)
+        if not (r26_on() and r26_norm_affine(
+            x_chunk,
+            norm_weight,
+            scale.reshape(-1),
+            shift.reshape(-1),
+            y,
+            1e-6,
+        )):
+            if not r17_mlp_norm_affine(
+                x_chunk,
+                norm_weight,
+                scale.reshape(-1),
+                shift.reshape(-1),
+                y,
+                1e-6,
+            ):
+                y = F.rms_norm(x_chunk, (dim,), norm_weight, 1e-6)
+                y = y * (1.0 + scale) + shift
+    else:
+        y = F.rms_norm(x_chunk, (dim,), norm_weight, 1e-6)
+        y = y * (1.0 + scale) + shift
 
     q, k, v = _slab_qkv(
         y,

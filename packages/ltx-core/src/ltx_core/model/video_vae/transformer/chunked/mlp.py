@@ -9,7 +9,7 @@ from torch import nn
 from ltx_core.model.video_vae.transformer.swiglu import (
     SwiGLUTileSpec,
     _fused_gate_up_swiglu_triton,
-    _fused_up_mul_torch,
+    _fused_silu_up_mul_torch,
     _fused_up_mul_triton,
     _resolve_use_triton,
     _tile_from_op_args,
@@ -71,7 +71,16 @@ def _chunked_residual_modulated_impl(
     # Triton needs every pointer on the launch device; all-CPU falls back to torch.mm.
     use_triton = _resolve_use_triton(bool(use_triton), x_flat, w_gate, w_up, w_down)
 
+    from ltx_core.model.video_vae.transformer.r26_vae import (
+        r26_norm_affine_precomputed,
+        r26_on,
+    )
+
     s, sh = _channel_affine_bc(scale, shift, dim)
+    use_r26 = r26_on()
+    affine_scale = (
+        (1.0 + s).to(torch.bfloat16).contiguous() if use_r26 else None
+    )
     max_chunk = max((iv.end - iv.start for iv in intervals), default=0)
     workspace = torch.empty((max_chunk, hidden), device=x.device, dtype=x.dtype)
     y_buf = torch.empty((max_chunk, dim), device=x.device, dtype=x.dtype)
@@ -79,6 +88,7 @@ def _chunked_residual_modulated_impl(
     use_dual = use_triton and dual_gate_up_triton_eligible(x, w_gate, w_up)
     w_gate_c = w_gate.contiguous() if use_dual else w_gate
     w_up_c = w_up.contiguous() if use_triton else w_up
+    from ltx_core.model.transformer.r8_sycl import r17_mlp_norm_affine
 
     for iv in intervals:
         start, end = iv.start, iv.end
@@ -87,19 +97,27 @@ def _chunked_residual_modulated_impl(
         n = end - start
         xc = x_flat[start:end]
         y = y_buf[:n]
-        y.copy_(F.rms_norm(xc, (dim,), norm_weight, eps))
-        y.mul_(1.0 + s).add_(sh)
+        if not (
+            use_r26
+            and affine_scale is not None
+            and r26_norm_affine_precomputed(
+                xc, norm_weight, affine_scale, sh, y, eps
+            )
+        ):
+            if not r17_mlp_norm_affine(xc, norm_weight, s, sh, y, eps):
+                y.copy_(F.rms_norm(xc, (dim,), norm_weight, eps))
+                y.mul_(1.0 + s).add_(sh)
 
         ws = workspace[:n]
         if use_dual:
             _fused_gate_up_swiglu_triton(y, w_gate_c, w_up_c, ws)
         else:
             torch.mm(y, w_gate.t(), out=ws)
-            F.silu(ws, inplace=True)
             if use_triton:
+                F.silu(ws, inplace=True)
                 _fused_up_mul_triton(y, w_up_c, ws)
             else:
-                _fused_up_mul_torch(y, w_up, ws)
+                _fused_silu_up_mul_torch(y, w_up, ws)
         torch.mm(ws, w_down.t(), out=out_buf[:n])
         xc.add_(out_buf[:n])
 
