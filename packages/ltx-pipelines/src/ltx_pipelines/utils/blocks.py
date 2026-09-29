@@ -78,8 +78,8 @@ from ltx_core.model.video_vae.keyframes import DecodeKeyframes
 from ltx_core.model.video_vae.transformer import (
     DiffVAEMode,
     NAttentionKind,
-    build_diffvae_mode_op,
-    na_dsl_available,
+    # DISABLED: build_diffvae_mode_op,
+    # DISABLED: na_dsl_available,
 )
 from ltx_core.quantization import QuantizationPolicy, fp8_cast_fuse_rule
 from ltx_core.text_encoders.gemma import (
@@ -500,7 +500,10 @@ class DiffusionStage:
 
     def _build_transformer(self, *, device: torch.device | None = None, **kwargs: object) -> X0Model:
         target = device or self._device
-        return X0Model(self._prepared_builder().build(device=target, **kwargs)).to(target).eval()
+        model = X0Model(self._prepared_builder().build(device=target, **kwargs)).to(target).eval()
+        from ltx_core.model.transformer.r9b_qkv import maybe_fuse_qkv
+        from ltx_core.model.transformer.r25_qkv import maybe_fuse_video_self_qkv
+        return maybe_fuse_video_self_qkv(maybe_fuse_qkv(model))
 
     @property
     def _is_streaming(self) -> bool:
@@ -1096,29 +1099,17 @@ class VideoDecoder:
         self._device = device
         self._diffvae_optimization = diffvae_optimization
         diffusion_vae = is_diffusion_video_vae(self._checkpoint_path)
-        self._diffusion_vae = diffusion_vae
-        cfg = diffvae_optimization.resolve() if diffusion_vae else None
-        use_dsl = cfg is not None and cfg.attention is NAttentionKind.BLACKWELL_DSL
+        if diffusion_vae:
+            # DISABLED: the diffusion video decoder is removed from this product path.
+            raise ValueError(f"diffusion video VAE checkpoints are unsupported: {self._checkpoint_path}")
+        self._diffusion_vae = False
         if decoder_builder is not None:
             self._decoder_builder = decoder_builder
         else:
-            if diffusion_vae and use_dsl and not na_dsl_available():
-                raise RuntimeError(
-                    "diffvae_optimization=blackwell_dsl needs a datacenter Blackwell GPU and "
-                    "nvidia-cutlass-dsl (uv sync --group kernels)"
-                )
-            sd_ops = (
-                video_decoder_sd_ops_for_checkpoint(
-                    self._checkpoint_path,
-                    diffusion_vae=True,
-                    na_dsl_kernel=use_dsl,
-                )
-                if diffusion_vae
-                else VAE_DECODER_COMFY_KEYS_FILTER
-            )
+            sd_ops = VAE_DECODER_COMFY_KEYS_FILTER
             module_ops: tuple[ModuleOps, ...] = ()
             # channels-last + memory-efficient decode apply to ConvVideoDecoder only
-            if memory_efficient and not diffusion_vae:
+            if memory_efficient:
                 sd_ops = SDOps(
                     name=f"sd_ops_chain_{sd_ops.name}+{CHANNELS_LAST_3D_WEIGHTS.name}",
                     mapping=(*sd_ops.mapping, *CHANNELS_LAST_3D_WEIGHTS.mapping),
@@ -1157,14 +1148,8 @@ class VideoDecoder:
         ``with_builder`` / Dist ``with_tiling`` swaps on the raw builder, while
         every build still installs the configured DiffVAE policy.
         """
-        builder = self._decoder_builder
-        if not self._diffusion_vae:
-            return builder
-        op = build_diffvae_mode_op(
-            self._diffvae_optimization,
-            CompilationConfig() if self._diffvae_optimization.resolve().compile_blocks else None,
-        )
-        return builder.with_module_ops((*builder.module_ops, op))
+        # DISABLED: DiffVAE mode ops. The conv decoder builds from the raw builder.
+        return self._decoder_builder
 
     def __call__(
         self,

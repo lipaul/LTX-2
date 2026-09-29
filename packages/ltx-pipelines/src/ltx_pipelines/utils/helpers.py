@@ -15,15 +15,15 @@ from ltx_core.loader.sft_loader import SafetensorsModelStateDictLoader
 from ltx_core.model.audio_vae import encode_audio
 from ltx_core.model.transformer import Modality
 from ltx_core.model.video_vae import AutoTiling, TileSizeConfig, TilingConfig, VideoEncoder
-from ltx_core.model.video_vae.diffusion_tiling import recommended_decode_tiling_config
+# DISABLED: from ltx_core.model.video_vae.diffusion_tiling import recommended_decode_tiling_config
 from ltx_core.model.video_vae.keyframes import DecodeKeyframes
 from ltx_core.model.video_vae.model_configurator import (
-    diffvae_tiling_geometry_from_vae_config,
-    estimate_diffusion_decoder_weight_bytes,
+    # DISABLED: diffvae_tiling_geometry_from_vae_config,
+    # DISABLED: estimate_diffusion_decoder_weight_bytes,
     is_diffusion_video_vae,
 )
 from ltx_core.model.video_vae.transformer.config import DiffVAEMode
-from ltx_core.model.video_vae.transformer.fallback_na import joint_sdpa_materializes_scores
+# DISABLED: from ltx_core.model.video_vae.transformer.fallback_na import joint_sdpa_materializes_scores
 from ltx_core.text_encoders.gemma import LTXGemmaTextEncoder
 from ltx_core.tiling import DimensionSizeConfig
 from ltx_core.tools import LatentTools
@@ -70,11 +70,8 @@ _CONV_AUTO_FRAMES = DimensionSizeConfig(tile_size=80, overlap=24)
 
 def tiling_scale_factors_for_vae(vae_checkpoint_path: str) -> SpatioTemporalScaleFactors:
     """Scale factors decode will pass to ``to_splitters`` for this checkpoint."""
-    if not is_diffusion_video_vae(vae_checkpoint_path):
-        return VIDEO_SCALE_FACTORS
-    metadata = SafetensorsModelStateDictLoader().metadata(vae_checkpoint_path)
-    vae_config = metadata.get("config", {}).get("vae", {})
-    return diffvae_tiling_geometry_from_vae_config(vae_config)["pixel_scale"]
+    # DISABLED: DiffVAE tiling geometry; the product path uses the conv VAE scale factors.
+    return VIDEO_SCALE_FACTORS
 
 
 def tiling_config_for_vae(
@@ -94,36 +91,32 @@ def tiling_config_for_vae(
     Pass ``keyframes=True`` for a keyframe-aware ``decode_video(keyframes=)`` decode: joint attention runs
     eager blocks, which changes both the stage-5 coefficient and the withheld reserve.
     """
-    if not is_diffusion_video_vae(vae_checkpoint_path):
-        _ = num_frames  # API parity with DiffVAE; Conv auto layout is aspect-only.
-        return TileSizeConfig.from_long_side(
-            long_side=_CONV_AUTO_LONG_SIDE,
-            height=height,
-            width=width,
-            scale_factors=VIDEO_SCALE_FACTORS,
-            frames=_CONV_AUTO_FRAMES,
-        )
-
-    metadata = SafetensorsModelStateDictLoader().metadata(vae_checkpoint_path)
-    vae_config = metadata.get("config", {}).get("vae", {})
-    geometry = diffvae_tiling_geometry_from_vae_config(vae_config)
-    model_bytes = estimate_diffusion_decoder_weight_bytes(vae_checkpoint_path)
-
-    resolved_device = device if device is not None else get_device()
-    if free_bytes is None:
-        free_bytes = activation_budget_bytes(resolved_device)
-
-    return recommended_decode_tiling_config(
-        **geometry,
+    if is_diffusion_video_vae(vae_checkpoint_path):
+        # DISABLED: the diffusion video VAE decoder is removed from this product path.
+        raise ValueError(f"diffusion video VAE checkpoints are unsupported: {vae_checkpoint_path}")
+    return TileSizeConfig.from_long_side(
+        long_side=_CONV_AUTO_LONG_SIDE,
         height=height,
         width=width,
-        num_frames=num_frames,
-        mode=diffvae_optimization,
-        free_bytes=free_bytes,
-        model_bytes=model_bytes,
-        keyframes=keyframes,
-        joint_sdpa_materializes=keyframes and joint_sdpa_materializes_scores(resolved_device),
+        scale_factors=VIDEO_SCALE_FACTORS,
+        frames=_CONV_AUTO_FRAMES,
     )
+
+# DISABLED: DiffVAE tiling resolution (halo / memory aware recommended_decode_tiling_config).
+# The original block follows, kept as comments for reference.
+#     metadata = SafetensorsModelStateDictLoader().metadata(vae_checkpoint_path)
+#     vae_config = metadata.get("config", {}).get("vae", {})
+#     geometry = diffvae_tiling_geometry_from_vae_config(vae_config)
+#     model_bytes = estimate_diffusion_decoder_weight_bytes(vae_checkpoint_path)
+#     resolved_device = device if device is not None else get_device()
+#     if free_bytes is None:
+#         free_bytes = activation_budget_bytes(resolved_device)
+#     return recommended_decode_tiling_config(
+#         **geometry, height=height, width=width, num_frames=num_frames,
+#         mode=diffvae_optimization, free_bytes=free_bytes, model_bytes=model_bytes,
+#         keyframes=keyframes,
+#         joint_sdpa_materializes=keyframes and joint_sdpa_materializes_scores(resolved_device),
+#     )
 
 
 def ensure_tiling_config(

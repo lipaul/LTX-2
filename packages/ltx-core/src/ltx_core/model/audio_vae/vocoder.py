@@ -604,7 +604,7 @@ class VocoderWithBWE(nn.Module, Disposable):
         module_dtype = next(self.parameters()).dtype
         fp32_ctx = (
             _module_in_fp32(self, enabled=module_dtype != torch.float32)
-            if device_type == "mps"
+            if device_type in ("mps", "xpu")
             else torch.autocast(device_type=device_type, dtype=torch.float32)
         )
 

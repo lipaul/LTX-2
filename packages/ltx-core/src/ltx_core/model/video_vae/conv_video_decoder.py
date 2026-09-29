@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Sequence
 from typing import Any, Iterator, List, Tuple
 
@@ -41,6 +42,16 @@ from ltx_core.tiling import (
 from ltx_core.types import SpatioTemporalScaleFactors, VideoLatentShape
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+def r39_sched_on() -> bool:
+    """Return whether the R39 concurrent spatial-tile decode is enabled."""
+    if os.environ.get("LTX_ALL_ORIG", "0") == "1":
+        return False
+    value = os.environ.get("LTX_R39_CONV_SCHED", "0")
+    if value not in {"0", "1"}:
+        raise ValueError("LTX_R39_CONV_SCHED must be 0 or 1")
+    return value == "1"
 
 
 def _decoder_bottleneck_channels(base_channels: int, decoder_blocks: List[Tuple[str, int | dict[str, Any]]]) -> int:
@@ -528,6 +539,35 @@ class ConvVideoDecoder(nn.Module, Disposable, VideoDecoder):
         """Decode each latent as its own one-frame clip, yielding one RGB tensor per latent."""
         yield from iter_decoded_single_frames(self, latents, generator)
 
+    def _decode_group_tiles(
+        self,
+        group_tiles: List[Tile],
+        latent: torch.Tensor,
+        timestep: torch.Tensor | None,
+        generator: torch.Generator | None,
+    ) -> List[torch.Tensor]:
+        """Decode every tile of a temporal group, optionally issuing the tiles on parallel streams.
+
+        Each tile decodes an independent latent crop, so the group can be issued concurrently.
+        Every produced tile is recorded on the consumer stream, which keeps the caching
+        allocator from handing its block to another stream while the consumer still reads it.
+        """
+        if not r39_sched_on() or latent.device.type != "xpu" or len(group_tiles) < 2:
+            return [self.forward(latent[tile.in_coords], timestep, generator) for tile in group_tiles]
+
+        consumer = torch.xpu.current_stream(latent.device)
+        streams = [torch.xpu.Stream(latent.device) for _ in group_tiles]
+        decoded: List[torch.Tensor] = []
+        for tile, stream in zip(group_tiles, streams):
+            stream.wait_stream(consumer)
+            with torch.xpu.stream(stream):
+                decoded.append(self.forward(latent[tile.in_coords], timestep, generator))
+        for stream in streams:
+            consumer.wait_stream(stream)
+        for tile_out in decoded:
+            tile_out.record_stream(consumer)
+        return decoded
+
     def _accumulate_temporal_group_into_buffer(
         self,
         group_tiles: List[Tile],
@@ -548,8 +588,7 @@ class ConvVideoDecoder(nn.Module, Disposable, VideoDecoder):
 
         weights: torch.Tensor | None = None if complementary else torch.zeros_like(buffer)
 
-        for tile in group_tiles:
-            decoded_tile = self.forward(latent[tile.in_coords], timestep, generator)
+        for tile, decoded_tile in zip(group_tiles, self._decode_group_tiles(group_tiles, latent, timestep, generator)):
             temporal_offset = tile.out_coords[2].start - temporal_slice.start
             # Use the tile's output coordinate length, not the decoded tile's length,
             # as the decoder may produce a different number of frames than expected

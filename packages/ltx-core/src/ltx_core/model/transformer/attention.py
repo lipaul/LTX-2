@@ -1,4 +1,5 @@
 import functools
+import os
 import sys
 from dataclasses import dataclass, field
 from enum import Enum
@@ -239,6 +240,18 @@ _SDPA_FULL_PRIORITY: tuple[SDPBackend, ...] = (
 )
 
 
+def _r24_flash_backend() -> SDPBackend | None:
+    """Return the explicit transformer attention backend selected by the R24 flag."""
+    value = os.environ.get("LTX_R24_FLASH")
+    if value is None:
+        return None
+    if value not in ("0", "1"):
+        raise ValueError("LTX_R24_FLASH must be 0 or 1")
+    if os.environ.get("LTX_ALL_ORIG", "0") == "1":
+        return None
+    return SDPBackend.MATH if value == "0" else SDPBackend.FLASH_ATTENTION
+
+
 def _on_macos() -> bool:
     """True on macOS, where torch's native SDPA materializes the score matrix and
     AUTOMATIC routes to Apple's fused ``mps-sdpa`` kernel instead."""
@@ -281,6 +294,9 @@ def _select_primary_attention() -> AttentionCallable:
     - Everywhere else (Ada, Ampere, CPU): SDPA with the full backend priority
       list -- torch's runtime dispatcher picks the best fit at call time.
     """
+    explicit_backend = _r24_flash_backend()
+    if explicit_backend is not None:
+        return PytorchAttention(priority=[explicit_backend])
     if torch.cuda.is_available():
         major, _ = torch.cuda.get_device_capability(0)
         if major == 9:
@@ -301,6 +317,11 @@ def _select_masked_attention() -> MaskedAttentionCallable:
     Intel/CPU macs); else SDPA with the full priority list (the dispatcher
     rejects FLASH automatically when a mask is present and walks past it --
     torch SDPA handles the additive mask directly)."""
+    explicit_backend = _r24_flash_backend()
+    if explicit_backend is SDPBackend.MATH:
+        return PytorchAttention(priority=[SDPBackend.MATH])
+    if explicit_backend is SDPBackend.FLASH_ATTENTION:
+        return _sdpa_full_priority()
     if _on_macos():
         return MPSSdpaAttention() if _mps_sdpa_available() else _sdpa_full_priority()
     return _sdpa_full_priority()
@@ -497,6 +518,9 @@ class Attention(torch.nn.Module):
         self.gated_attention_function = ops.gated_attention_function
 
         inner_dim = dim_head * heads
+        # R9B: capture self-ness at construction (post-load dim equality is
+        # ambiguous: cross-text context_dim can equal query_dim).
+        self._r9b_is_self = context_dim is None
         context_dim = query_dim if context_dim is None else context_dim
 
         self.heads = heads
@@ -556,13 +580,22 @@ class Attention(torch.nn.Module):
         context = x if context is None else context
         use_attention = not all_perturbed
 
-        v = self.to_v(context)
+        # R9B fused projections (post-load hook installs to_qkv/to_kv).
+        if hasattr(self, "to_qkv"):
+            q, k, v = self.to_qkv(x).chunk(3, dim=-1)
+        elif hasattr(self, "to_kv"):
+            k, v = self.to_kv(context).chunk(2, dim=-1)
+            if use_attention:
+                q = self.to_q(x)
+        else:
+            v = self.to_v(context)
+            if use_attention:
+                q = self.to_q(x)
+                k = self.to_k(context)
 
         if not use_attention:
             out = v
         else:
-            q = self.to_q(x)
-            k = self.to_k(context)
             q, k = self.preattention_function(q, k, self, mask, pe, k_pe)
             if mask is None:
                 out = self.attention_function(q, k, v, self.heads)  # (B, T, H*D)

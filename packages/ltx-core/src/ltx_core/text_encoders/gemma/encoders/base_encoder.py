@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import os
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,15 @@ GEMMA4_ENHANCE_GENERATION_KWARGS: dict[str, Any] = {
 }
 
 
+def _r23_gemma_enabled() -> bool:
+    if os.environ.get("LTX_ALL_ORIG", "0") == "1":
+        return False
+    value = os.environ.get("LTX_R23_GEMMA", "1")
+    if value not in {"0", "1"}:
+        raise ValueError("LTX_R23_GEMMA must be 0 or 1")
+    return value == "1"
+
+
 class LTXGemmaTextEncoder(torch.nn.Module, Disposable):
     """Pure Gemma text encoder — runs the LLM and returns raw hidden states.
     Prompt enhancement (generate) is also supported since the full Gemma
@@ -46,13 +56,46 @@ class LTXGemmaTextEncoder(torch.nn.Module, Disposable):
         self.processor = processor
         self._dtype = dtype
 
+    def _encode_valid_token_crop(
+        self, input_ids: torch.Tensor, attention_mask: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        """Evaluate the valid suffix while preserving absolute rotary positions and output length."""
+        batch_size, sequence_length = input_ids.shape
+        valid_lengths = attention_mask.ne(0).to(torch.int64).sum(dim=1)
+        crop_length = int(valid_lengths.max().item())
+        if crop_length <= 0 or crop_length >= sequence_length:
+            outputs = self.model.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                use_cache=False,
+            )
+            return outputs.hidden_states
+
+        start = sequence_length - crop_length
+        cropped_ids = input_ids[:, start:]
+        cropped_mask = attention_mask[:, start:]
+        position_ids = torch.arange(start, sequence_length, device=input_ids.device, dtype=torch.long)
+        position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
+        outputs = self.model.model(
+            input_ids=cropped_ids,
+            attention_mask=cropped_mask,
+            position_ids=position_ids,
+            output_hidden_states=True,
+            use_cache=False,
+        )
+        valid = cropped_mask.ne(0).view(batch_size, crop_length, 1)
+        restored = []
+        for hidden_state in outputs.hidden_states:
+            hidden_state = torch.where(valid, hidden_state, torch.zeros_like(hidden_state))
+            restored.append(torch.nn.functional.pad(hidden_state, (0, 0, sequence_length - crop_length, 0)))
+        return tuple(restored)
+
     def encode(self, prompts: list[str]) -> list[tuple[tuple[torch.Tensor, ...], torch.Tensor]]:
-        """Run a single fused Gemma forward over a batch of prompts.
-        Calls the inner model (self.model.model) to skip lm_head logits computation
-        (~500 MiB saving). The tokenizer pads every prompt to ``max_length`` (1024),
-        so the inputs stack into a single ``[N, 1024]`` batch with no further padding
-        logic; per-prompt outputs are sliced back to ``[1, 1024, D]`` / ``[1, 1024]``
-        in the original order.
+        """Run Gemma and return hidden states with the tokenizer sequence length.
+        The R23 path evaluates the valid left-padded suffix, preserves its absolute
+        position IDs, and restores the fixed 1024-token output contract. The flag
+        zero path evaluates the original padded batch.
         """
         if not prompts:
             return []
@@ -65,10 +108,16 @@ class LTXGemmaTextEncoder(torch.nn.Module, Disposable):
             [[w for _, w in pairs] for pairs in tokenized],
             device=self.model.device,
         )
-        outputs = self.model.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
-        hidden_states = outputs.hidden_states
-        del outputs
-        return [(tuple(h[i : i + 1] for h in hidden_states), attention_mask[i : i + 1]) for i in range(len(prompts))]
+        if _r23_gemma_enabled():
+            hidden_states = self._encode_valid_token_crop(input_ids, attention_mask)
+        else:
+            outputs = self.model.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+            hidden_states = outputs.hidden_states
+            del outputs
+        return [
+            (tuple(h[i : i + 1] for h in hidden_states), attention_mask[i : i + 1])
+            for i in range(len(prompts))
+        ]
 
     def _model_type(self) -> str:
         return getattr(getattr(self.model, "config", None), "model_type", "") or ""

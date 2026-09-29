@@ -8,12 +8,12 @@ from ltx_core.loader.sd_ops import KeyValueOperationResult, SDOps
 from ltx_core.loader.sft_loader import SafetensorsModelStateDictLoader
 from ltx_core.model.model_protocol import ModelConfigurator
 from ltx_core.model.video_vae.enums import LogVarianceType, NormLayerType, PaddingModeType
-from ltx_core.model.video_vae.transformer.dsl_kernels import (
-    FUSED_CTX_BIAS_BUFFER,
-    FUSED_CTX_WEIGHT_BUFFER,
-    NA_SOFTMAX_BOUND_BUFFER,
-)
-from ltx_core.model.video_vae.video_vae import ConvVideoDecoder, DiffusionVideoDecoder, VideoDecoder, VideoEncoder
+# DISABLED: from ltx_core.model.video_vae.transformer.dsl_kernels import (
+# DISABLED:     FUSED_CTX_BIAS_BUFFER,
+# DISABLED:     FUSED_CTX_WEIGHT_BUFFER,
+# DISABLED:     NA_SOFTMAX_BOUND_BUFFER,
+# DISABLED: )
+from ltx_core.model.video_vae.video_vae import ConvVideoDecoder, VideoDecoder, VideoEncoder
 
 _CONV_VAE_CLASS_NAME = "CausalVideoAutoencoder"
 
@@ -94,47 +94,48 @@ def _build_conv_video_decoder(config: dict) -> ConvVideoDecoder:
     )
 
 
-def _build_diffusion_video_decoder(config: dict) -> DiffusionVideoDecoder:
-    """Build a ``DiffusionVideoDecoder`` from a ``vae`` configuration dictionary.
-    Real checkpoints (``_class_name: "CausalDiffusionVAE"``) nest decoder
-    hyperparameters under ``vae.decoder``; fall back to the flat ``vae`` dict
-    itself for configs that put them there directly. Architecture fields
-    absent from config (e.g. ``t_emb_dim``, stage ladders) are left at the
-    class defaults by omitting them from the constructor call.
-    """
-    decoder_config = config.get("decoder", config)
-    # Optional architecture overrides - only pass when present so class defaults apply.
-    architecture: dict = {}
-    if "stage_channels" in decoder_config:
-        architecture["stage_channels"] = tuple(decoder_config["stage_channels"])
-    if "stage_depths" in decoder_config:
-        architecture["stage_depths"] = tuple(decoder_config["stage_depths"])
-    if "stage_kernels" in decoder_config:
-        architecture["stage_kernels"] = tuple(tuple(kernel) for kernel in decoder_config["stage_kernels"])
-    if "upsamples" in decoder_config:
-        architecture["upsamples"] = tuple(
-            (tuple(stride), reduction) for stride, reduction in decoder_config["upsamples"]
-        )
-    if "stage5_kernel" in decoder_config:
-        architecture["stage5_kernel"] = tuple(decoder_config["stage5_kernel"])
-    if "stage5_channels" in decoder_config:
-        architecture["stage5_channels"] = decoder_config["stage5_channels"]
-
-    return DiffusionVideoDecoder(
-        in_channels=decoder_config.get("in_channels", config.get("latent_channels", 128)),
-        out_channels=decoder_config.get("out_channels", 3),
-        patch_size=decoder_config.get("patch_size", 4),
-        head_dim=decoder_config.get("head_dim", decoder_config.get("na_head_dim", 64)),
-        t_emb_dim=decoder_config.get("t_emb_dim", 384),
-        default_num_inference_steps=decoder_config.get("default_num_inference_steps", 2),
-        timestep_scale_multiplier=decoder_config.get("timestep_scale_multiplier", 1.0),
-        # Sibling of "decoder" at the top vae level (CausalDiffusionVAE.from_config
-        # reads it there too), not nested under decoder_config.
-        model_output_type=config.get("model_output_type", "v"),
-        **architecture,
-    )
-
-
+# DISABLED: def _build_diffusion_video_decoder (DiffVAE path removed)
+# def _build_diffusion_video_decoder(config: dict) -> DiffusionVideoDecoder:
+#     """Build a ``DiffusionVideoDecoder`` from a ``vae`` configuration dictionary.
+#     Real checkpoints (``_class_name: "CausalDiffusionVAE"``) nest decoder
+#     hyperparameters under ``vae.decoder``; fall back to the flat ``vae`` dict
+#     itself for configs that put them there directly. Architecture fields
+#     absent from config (e.g. ``t_emb_dim``, stage ladders) are left at the
+#     class defaults by omitting them from the constructor call.
+#     """
+#     decoder_config = config.get("decoder", config)
+#     # Optional architecture overrides - only pass when present so class defaults apply.
+#     architecture: dict = {}
+#     if "stage_channels" in decoder_config:
+#         architecture["stage_channels"] = tuple(decoder_config["stage_channels"])
+#     if "stage_depths" in decoder_config:
+#         architecture["stage_depths"] = tuple(decoder_config["stage_depths"])
+#     if "stage_kernels" in decoder_config:
+#         architecture["stage_kernels"] = tuple(tuple(kernel) for kernel in decoder_config["stage_kernels"])
+#     if "upsamples" in decoder_config:
+#         architecture["upsamples"] = tuple(
+#             (tuple(stride), reduction) for stride, reduction in decoder_config["upsamples"]
+#         )
+#     if "stage5_kernel" in decoder_config:
+#         architecture["stage5_kernel"] = tuple(decoder_config["stage5_kernel"])
+#     if "stage5_channels" in decoder_config:
+#         architecture["stage5_channels"] = decoder_config["stage5_channels"]
+# 
+#     return DiffusionVideoDecoder(
+#         in_channels=decoder_config.get("in_channels", config.get("latent_channels", 128)),
+#         out_channels=decoder_config.get("out_channels", 3),
+#         patch_size=decoder_config.get("patch_size", 4),
+#         head_dim=decoder_config.get("head_dim", decoder_config.get("na_head_dim", 64)),
+#         t_emb_dim=decoder_config.get("t_emb_dim", 384),
+#         default_num_inference_steps=decoder_config.get("default_num_inference_steps", 2),
+#         timestep_scale_multiplier=decoder_config.get("timestep_scale_multiplier", 1.0),
+#         # Sibling of "decoder" at the top vae level (CausalDiffusionVAE.from_config
+#         # reads it there too), not nested under decoder_config.
+#         model_output_type=config.get("model_output_type", "v"),
+#         **architecture,
+#     )
+# 
+# 
 def stage4_channels_from_decoder_config(decoder_config: dict) -> int:
     """Channels at stage-4 input (= output of deterministic stages 1-3).
     ``stage_channels[3]`` after the first three upsample hops.
@@ -174,71 +175,73 @@ def stage5_channels_from_decoder_config(decoder_config: dict) -> int:
     return (dim // head_dim) * head_dim
 
 
-def diffvae_tiling_geometry_from_vae_config(config: dict) -> dict:
-    """Resolve DiffVAE tiling geometry from a ``vae`` config dict (no module build).
-    Returns kwargs for :func:`ltx_core.model.video_vae.diffusion_tiling.recommended_decode_tiling_config`
-    except resolution / memory fields: ``tile_halos``, ``pixel_scale``, ``min_tile_size_s4``,
-    ``patch_size``, ``stage5_channels``, ``stage4_channels``, ``upsample_strides``,
-    ``natten_trailing_pad_latent_frames``, ``out_channels``.
-    """
-    # Local import: avoid a hard cycle at module import time.
-    from ltx_core.model.video_vae import diffusion_tiling as dt  # noqa: PLC0415
-    from ltx_core.model.video_vae import diffusion_video_decoder as dvd  # noqa: PLC0415
-
-    decoder_config = config.get("decoder", config)
-    stage_kernels = (
-        tuple(tuple(k) for k in decoder_config["stage_kernels"])
-        if "stage_kernels" in decoder_config
-        else dvd._L_STAGE_KERNELS
-    )
-    stage_depths = (
-        tuple(decoder_config["stage_depths"]) if "stage_depths" in decoder_config else dvd._DIFF_STAGE_DEPTHS_DEFAULT
-    )
-    upsamples = (
-        tuple((tuple(stride), reduction) for stride, reduction in decoder_config["upsamples"])
-        if "upsamples" in decoder_config
-        else dvd._L_UPSAMPLES
-    )
-    stage5_kernel = (
-        tuple(decoder_config["stage5_kernel"]) if "stage5_kernel" in decoder_config else dvd._DIFF_STAGE5_KERNEL_DEFAULT
-    )
-    patch_size = int(decoder_config.get("patch_size", 4))
-    up3_stride = upsamples[3][0]
-    return {
-        "tile_halos": dt.compute_tile_halos(
-            stage_kernels[3],
-            stage_depths[3],
-            stage5_kernel,
-            stage_depths[-1],
-            up3_stride,
-        ),
-        "pixel_scale": dt.stage4_to_pixel_scale_factors(up3_stride, patch_size),
-        "min_tile_size_s4": dt.compute_tile_min_size(stage_kernels[3], stage5_kernel, up3_stride),
-        "patch_size": patch_size,
-        "stage5_channels": stage5_channels_from_decoder_config(decoder_config),
-        "stage4_channels": stage4_channels_from_decoder_config(decoder_config),
-        "upsample_strides": tuple(stride for stride, _reduction in upsamples),
-        "natten_trailing_pad_latent_frames": (stage_kernels[0][0] // 2) * 2,
-        "out_channels": int(decoder_config.get("out_channels", 3)),
-    }
-
-
-def estimate_diffusion_decoder_weight_bytes(checkpoint_path: str | Path) -> int:
-    """Sum on-disk bf16-sized nbytes for ``vae.decoder`` / ``decoder`` tensors (header only)."""
-    path = Path(checkpoint_path)
-    total = 0
-    with safetensors.safe_open(path, framework="pt", device="cpu") as handle:
-        for key in handle.keys():  # noqa: SIM118  # safetensors SafeOpen is not a Mapping
-            if not (key.startswith(("vae.decoder.", "decoder.")) or "per_channel_statistics" in key):
-                continue
-            shape = handle.get_slice(key).get_shape()
-            n = 1
-            for dim in shape:
-                n *= int(dim)
-            total += n * 2  # bf16
-    return total
-
-
+# DISABLED: def diffvae_tiling_geometry_from_vae_config (DiffVAE path removed)
+# def diffvae_tiling_geometry_from_vae_config(config: dict) -> dict:
+#     """Resolve DiffVAE tiling geometry from a ``vae`` config dict (no module build).
+#     Returns kwargs for :func:`ltx_core.model.video_vae.diffusion_tiling.recommended_decode_tiling_config`
+#     except resolution / memory fields: ``tile_halos``, ``pixel_scale``, ``min_tile_size_s4``,
+#     ``patch_size``, ``stage5_channels``, ``stage4_channels``, ``upsample_strides``,
+#     ``natten_trailing_pad_latent_frames``, ``out_channels``.
+#     """
+#     # Local import: avoid a hard cycle at module import time.
+#     from ltx_core.model.video_vae import diffusion_tiling as dt  # noqa: PLC0415
+#     from ltx_core.model.video_vae import diffusion_video_decoder as dvd  # noqa: PLC0415
+# 
+#     decoder_config = config.get("decoder", config)
+#     stage_kernels = (
+#         tuple(tuple(k) for k in decoder_config["stage_kernels"])
+#         if "stage_kernels" in decoder_config
+#         else dvd._L_STAGE_KERNELS
+#     )
+#     stage_depths = (
+#         tuple(decoder_config["stage_depths"]) if "stage_depths" in decoder_config else dvd._DIFF_STAGE_DEPTHS_DEFAULT
+#     )
+#     upsamples = (
+#         tuple((tuple(stride), reduction) for stride, reduction in decoder_config["upsamples"])
+#         if "upsamples" in decoder_config
+#         else dvd._L_UPSAMPLES
+#     )
+#     stage5_kernel = (
+#         tuple(decoder_config["stage5_kernel"]) if "stage5_kernel" in decoder_config else dvd._DIFF_STAGE5_KERNEL_DEFAULT
+#     )
+#     patch_size = int(decoder_config.get("patch_size", 4))
+#     up3_stride = upsamples[3][0]
+#     return {
+#         "tile_halos": dt.compute_tile_halos(
+#             stage_kernels[3],
+#             stage_depths[3],
+#             stage5_kernel,
+#             stage_depths[-1],
+#             up3_stride,
+#         ),
+#         "pixel_scale": dt.stage4_to_pixel_scale_factors(up3_stride, patch_size),
+#         "min_tile_size_s4": dt.compute_tile_min_size(stage_kernels[3], stage5_kernel, up3_stride),
+#         "patch_size": patch_size,
+#         "stage5_channels": stage5_channels_from_decoder_config(decoder_config),
+#         "stage4_channels": stage4_channels_from_decoder_config(decoder_config),
+#         "upsample_strides": tuple(stride for stride, _reduction in upsamples),
+#         "natten_trailing_pad_latent_frames": (stage_kernels[0][0] // 2) * 2,
+#         "out_channels": int(decoder_config.get("out_channels", 3)),
+#     }
+# 
+# 
+# DISABLED: def estimate_diffusion_decoder_weight_bytes (DiffVAE path removed)
+# def estimate_diffusion_decoder_weight_bytes(checkpoint_path: str | Path) -> int:
+#     """Sum on-disk bf16-sized nbytes for ``vae.decoder`` / ``decoder`` tensors (header only)."""
+#     path = Path(checkpoint_path)
+#     total = 0
+#     with safetensors.safe_open(path, framework="pt", device="cpu") as handle:
+#         for key in handle.keys():  # noqa: SIM118  # safetensors SafeOpen is not a Mapping
+#             if not (key.startswith(("vae.decoder.", "decoder.")) or "per_channel_statistics" in key):
+#                 continue
+#             shape = handle.get_slice(key).get_shape()
+#             n = 1
+#             for dim in shape:
+#                 n *= int(dim)
+#             total += n * 2  # bf16
+#     return total
+# 
+# 
 class VideoDecoderConfigurator(ModelConfigurator[VideoDecoder]):
     """Configurator for creating a video VAE Decoder from a configuration dictionary."""
 
@@ -247,7 +250,11 @@ class VideoDecoderConfigurator(ModelConfigurator[VideoDecoder]):
         config = metadata.get("config", {}).get("vae", {})
         if _vae_class_name_from_metadata(metadata) == _CONV_VAE_CLASS_NAME:
             return _build_conv_video_decoder(config)
-        return _build_diffusion_video_decoder(config)
+        # DISABLED: the diffusion video decoder is removed from this product path.
+        raise ValueError(
+            "diffusion video VAE checkpoints are unsupported: "
+            f"{_vae_class_name_from_metadata(metadata)!r}"
+        )
 
 
 # Accept both monolithic ``vae.*`` prefixes and Comfy-split bare ``encoder.*`` /

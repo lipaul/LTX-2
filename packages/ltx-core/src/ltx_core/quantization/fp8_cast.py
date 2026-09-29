@@ -1,3 +1,9 @@
+import atexit
+import json
+import os
+import threading
+import weakref
+from collections import OrderedDict
 from pathlib import Path
 
 import safetensors
@@ -91,9 +97,427 @@ def _upcast_and_round(
     available (e.g., on Windows) or cannot compile ``fp8e4nv`` (pre-Ada GPUs),
     this falls back to deterministic (nearest) rounding via ``weight.to(dtype)``.
     """
+    # R9A (additive): vectorized fp8(e4m3fn)->bf16 widening kernel.
+    # Off by default; LTX_R9A_FP8K=1 enables it. Falls back to weight.to(dtype)
+    # on any unsupported case / exception.
+    if (
+        weight.dtype == torch.float8_e4m3fn
+        and dtype == torch.bfloat16
+        and not with_stochastic_rounding
+    ):
+        try:
+            from ltx_core.model.transformer import r8_sycl as _R8
+
+            _g = _R8.r9a_fp8_widen(weight)
+            if _g is not None:
+                return _g
+        except Exception:  # noqa: BLE001
+            pass
     if not with_stochastic_rounding or not _use_triton_fp8_kernel(weight.device):
         return weight.to(dtype)
     return fused_add_round_launch(torch.zeros_like(weight, dtype=dtype), weight, seed)
+
+
+_R18_FP8_BF16_CACHE_LOCK = threading.RLock()
+_R18_FP8_BF16_CACHE_USED_BYTES = 0
+_R18_FP8_BF16_CACHE_STATS = {
+    "calls": 0,
+    "hits": 0,
+    "misses": 0,
+    "stored_bytes": 0,
+    "peak_bytes": 0,
+    "budget_bytes": 0,
+}
+
+
+def _r18_fp8_bf16_cache_enabled() -> bool:
+    if os.environ.get("LTX_ALL_ORIG", "0") == "1":
+        return False
+    value = os.environ.get("LTX_R18_FP8_BF16_CACHE", "0")
+    if value not in {"0", "1"}:
+        raise ValueError("LTX_R18_FP8_BF16_CACHE must be 0 or 1")
+    return value == "1"
+
+
+def _r18_fp8_bf16_cache_budget_bytes() -> int:
+    value = os.environ.get("LTX_R18_FP8_BF16_CACHE_GIB", "6")
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError("LTX_R18_FP8_BF16_CACHE_GIB must be an integer") from exc
+    if not 1 <= parsed <= 12:
+        raise ValueError("LTX_R18_FP8_BF16_CACHE_GIB must be in [1,12]")
+    return parsed * 1024**3
+
+
+def _r18_cached_bf16_upcast(
+    layer: torch.nn.Linear,
+    slot: str,
+    source: torch.Tensor,
+    target_dtype: torch.dtype,
+    seed: int,
+) -> torch.Tensor:
+    global _R18_FP8_BF16_CACHE_USED_BYTES
+    key = _r4_cache_key(source, target_dtype)
+    entry = getattr(layer, slot, None)
+    if entry is not None and entry[0] == key:
+        _R18_FP8_BF16_CACHE_STATS["hits"] += 1
+        return entry[1]
+    _R18_FP8_BF16_CACHE_STATS["misses"] += 1
+    fresh = _upcast_and_round(source, target_dtype, False, seed)
+    fresh_bytes = fresh.numel() * fresh.element_size()
+    budget = _r18_fp8_bf16_cache_budget_bytes()
+    with _R18_FP8_BF16_CACHE_LOCK:
+        old = getattr(layer, slot, None)
+        if old is not None:
+            _R18_FP8_BF16_CACHE_USED_BYTES -= old[1].numel() * old[1].element_size()
+        if _R18_FP8_BF16_CACHE_USED_BYTES + fresh_bytes <= budget:
+            _R18_FP8_BF16_CACHE_USED_BYTES += fresh_bytes
+            setattr(layer, slot, (key, fresh))
+            _R18_FP8_BF16_CACHE_STATS["stored_bytes"] = _R18_FP8_BF16_CACHE_USED_BYTES
+        else:
+            setattr(layer, slot, None)
+        _R18_FP8_BF16_CACHE_STATS["used_bytes"] = _R18_FP8_BF16_CACHE_USED_BYTES
+        _R18_FP8_BF16_CACHE_STATS["peak_bytes"] = max(
+            _R18_FP8_BF16_CACHE_STATS["peak_bytes"],
+            _R18_FP8_BF16_CACHE_USED_BYTES,
+        )
+        _R18_FP8_BF16_CACHE_STATS["budget_bytes"] = budget
+    return fresh
+
+
+def _r18_print_fp8_bf16_cache_stats() -> None:
+    if _R18_FP8_BF16_CACHE_STATS["calls"] > 0:
+        print(
+            "R18_FP8_BF16_CACHE_STATS "
+            + json.dumps(_R18_FP8_BF16_CACHE_STATS, sort_keys=True),
+            flush=True,
+        )
+
+
+atexit.register(_r18_print_fp8_bf16_cache_stats)
+
+
+# R20: bounded keyed oneDNN FP8 prepack path for repeated FP8 linear weights.
+_R20_FP8_CACHE_MAX_ENTRIES = 2048
+_R20_FP8_CACHE_BUDGET_BYTES = 16 * 1024**2
+_R20_FP8_CACHE_LOCK = threading.RLock()
+_R20_FP8_CACHE_LRU: OrderedDict[int, tuple[object, object]] = OrderedDict()
+_R20_FP8_CACHE_USED_BYTES = 0
+_R20_FP8_CACHE_STATS = {
+    "forward_calls": 0,
+    "direct_calls": 0,
+    "weight_hits": 0,
+    "weight_misses": 0,
+    "bias_widenings": 0,
+    "admitted": 0,
+    "rejected": 0,
+    "evicted": 0,
+    "used_bytes": 0,
+    "peak_bytes": 0,
+}
+_R20_FP8_QPARAM_CACHE: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+
+try:
+    _R20_QPREPACK = torch.ops.onednn.qlinear_prepack
+    _R20_QPOINTWISE = torch.ops.onednn.qlinear_pointwise
+except AttributeError:
+    _R20_QPREPACK = None
+    _R20_QPOINTWISE = None
+
+
+class _R20Fp8CacheEntry:
+    __slots__ = ("key", "prepacked_weight", "bias", "nbytes")
+
+    def __init__(self, key: tuple, prepacked_weight: torch.Tensor, bias: torch.Tensor | None, nbytes: int) -> None:
+        self.key = key
+        self.prepacked_weight = prepacked_weight
+        self.bias = bias
+        self.nbytes = nbytes
+
+
+def _r20_fp8_cache_enabled() -> bool:
+    if os.environ.get("LTX_ALL_ORIG", "0") == "1":
+        return False
+    value = os.environ.get("LTX_R20_FP8_CACHE", "0")
+    if value not in {"0", "1"}:
+        raise ValueError("LTX_R20_FP8_CACHE must be 0 or 1")
+    return value == "1"
+
+
+def _r20_tensor_cache_key(source: torch.Tensor, target_dtype: torch.dtype) -> tuple:
+    version = None if torch.is_inference(source) else int(source._version)
+    return (
+        source.data_ptr(),
+        version,
+        tuple(source.shape),
+        tuple(source.stride()),
+        source.dtype,
+        str(source.device),
+        target_dtype,
+    )
+
+
+def _r20_linear_cache_key(
+    layer: torch.nn.Linear,
+    target_dtype: torch.dtype,
+    shape_key: tuple[int, int],
+) -> tuple:
+    bias_key = _r20_tensor_cache_key(layer.bias, target_dtype) if layer.bias is not None else None
+    return _r20_tensor_cache_key(layer.weight, target_dtype), bias_key, shape_key
+
+
+def _r20_direct_admissible(layer: torch.nn.Linear, input: torch.Tensor) -> bool:
+    weight = layer.weight
+    bias = layer.bias
+    return (
+        _R20_QPREPACK is not None
+        and _R20_QPOINTWISE is not None
+        and input.is_xpu
+        and input.dtype == torch.bfloat16
+        and input.numel() > 0
+        and weight.is_xpu
+        and weight.dtype == torch.float8_e4m3fn
+        and weight.dim() == 2
+        and weight.is_contiguous()
+        and input.shape[-1] == weight.shape[1]
+        and (bias is None or (bias.dtype in (torch.float8_e4m3fn, torch.bfloat16) and bias.is_contiguous()))
+    )
+
+
+def _r20_qparams(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    key = str(device)
+    with _R20_FP8_CACHE_LOCK:
+        params = _R20_FP8_QPARAM_CACHE.get(key)
+        if params is None:
+            params = (
+                torch.ones((), dtype=torch.float32, device=device),
+                torch.zeros((), dtype=torch.float8_e4m3fn, device=device),
+            )
+            _R20_FP8_QPARAM_CACHE[key] = params
+        return params
+
+
+def _r20_cache_ref(layer: torch.nn.Linear, identifier: int) -> object:
+    def remove(ref: object) -> None:
+        global _R20_FP8_CACHE_USED_BYTES
+        with _R20_FP8_CACHE_LOCK:
+            current = _R20_FP8_CACHE_LRU.get(identifier)
+            if current is None or current[0] is not ref:
+                return
+            _R20_FP8_CACHE_LRU.pop(identifier, None)
+            _R20_FP8_CACHE_USED_BYTES -= current[1].nbytes
+            _R20_FP8_CACHE_STATS["evicted"] += 1
+            _R20_FP8_CACHE_STATS["used_bytes"] = _R20_FP8_CACHE_USED_BYTES
+
+    return weakref.ref(layer, remove)
+
+
+def _r20_remove_entry_locked(identifier: int, layer: torch.nn.Linear) -> None:
+    global _R20_FP8_CACHE_USED_BYTES
+    old = _R20_FP8_CACHE_LRU.pop(identifier, None)
+    if old is not None:
+        entry = old[1]
+        _R20_FP8_CACHE_USED_BYTES -= entry.nbytes
+        _R20_FP8_CACHE_STATS["used_bytes"] = _R20_FP8_CACHE_USED_BYTES
+        if getattr(layer, "_r20_fp8_cache_entry", None) is entry:
+            delattr(layer, "_r20_fp8_cache_entry")
+
+
+def _r20_admit_entry_locked(
+    layer: torch.nn.Linear,
+    identifier: int,
+    entry: _R20Fp8CacheEntry,
+) -> bool:
+    global _R20_FP8_CACHE_USED_BYTES
+    _r20_remove_entry_locked(identifier, layer)
+    while _R20_FP8_CACHE_LRU and (
+        len(_R20_FP8_CACHE_LRU) >= _R20_FP8_CACHE_MAX_ENTRIES
+        or entry.nbytes > _R20_FP8_CACHE_BUDGET_BYTES - _R20_FP8_CACHE_USED_BYTES
+    ):
+        old_identifier, old_ref_entry = next(iter(_R20_FP8_CACHE_LRU.items()))
+        old_layer = old_ref_entry[0]()
+        if old_layer is None:
+            _R20_FP8_CACHE_LRU.pop(old_identifier, None)
+            _R20_FP8_CACHE_USED_BYTES -= old_ref_entry[1].nbytes
+            _R20_FP8_CACHE_STATS["used_bytes"] = _R20_FP8_CACHE_USED_BYTES
+            continue
+        _r20_remove_entry_locked(old_identifier, old_layer)
+        _R20_FP8_CACHE_STATS["evicted"] += 1
+    if entry.nbytes > _R20_FP8_CACHE_BUDGET_BYTES - _R20_FP8_CACHE_USED_BYTES:
+        _R20_FP8_CACHE_STATS["rejected"] += 1
+        return False
+    _R20_FP8_CACHE_LRU[identifier] = (_r20_cache_ref(layer, identifier), entry)
+    _R20_FP8_CACHE_USED_BYTES += entry.nbytes
+    _R20_FP8_CACHE_STATS["admitted"] += 1
+    _R20_FP8_CACHE_STATS["used_bytes"] = _R20_FP8_CACHE_USED_BYTES
+    _R20_FP8_CACHE_STATS["peak_bytes"] = max(
+        _R20_FP8_CACHE_STATS["peak_bytes"], _R20_FP8_CACHE_USED_BYTES
+    )
+    setattr(layer, "_r20_fp8_cache_entry", entry)
+    return True
+
+
+def _r20_cache_stats_snapshot() -> dict[str, int | float | None]:
+    with _R20_FP8_CACHE_LOCK:
+        total = _R20_FP8_CACHE_STATS["weight_hits"] + _R20_FP8_CACHE_STATS["weight_misses"]
+        result: dict[str, int | float | None] = dict(_R20_FP8_CACHE_STATS)
+        result["hit_rate"] = (_R20_FP8_CACHE_STATS["weight_hits"] / total) if total else None
+        result["max_entries"] = _R20_FP8_CACHE_MAX_ENTRIES
+        result["budget_bytes"] = _R20_FP8_CACHE_BUDGET_BYTES
+        return result
+
+
+def r20_fp8_cache_stats() -> dict[str, int | float | None]:
+    return _r20_cache_stats_snapshot()
+
+
+def _r20_print_cache_stats() -> None:
+    if _R20_FP8_CACHE_STATS["direct_calls"] == 0:
+        return
+    print("R20_FP8_CACHE_STATS " + json.dumps(_r20_cache_stats_snapshot(), sort_keys=True), flush=True)
+
+
+atexit.register(_r20_print_cache_stats)
+
+
+def _r20_direct_fp8_linear(layer: torch.nn.Linear, input: torch.Tensor) -> torch.Tensor | None:
+    if not _r20_direct_admissible(layer, input):
+        return None
+    global _R20_FP8_CACHE_USED_BYTES
+    identifier = id(layer)
+    shape_key = (input.numel() // input.shape[-1], input.shape[-1])
+    key = _r20_linear_cache_key(layer, torch.bfloat16, shape_key)
+    entry = getattr(layer, "_r20_fp8_cache_entry", None)
+    with _R20_FP8_CACHE_LOCK:
+        _R20_FP8_CACHE_STATS["forward_calls"] += 1
+        if entry is not None and entry.key == key:
+            current = _R20_FP8_CACHE_LRU.get(identifier)
+            if current is None or current[1] is not entry:
+                _R20_FP8_CACHE_LRU[identifier] = (_r20_cache_ref(layer, identifier), entry)
+            else:
+                _R20_FP8_CACHE_LRU.move_to_end(identifier)
+            _R20_FP8_CACHE_STATS["direct_calls"] += 1
+            _R20_FP8_CACHE_STATS["weight_hits"] += 1
+            prepacked_weight = entry.prepacked_weight
+            bias = entry.bias
+        else:
+            _R20_FP8_CACHE_STATS["weight_misses"] += 1
+            prepacked_weight = _R20_QPREPACK(layer.weight, [shape_key[0], shape_key[1]])
+            bias = layer.bias
+            if bias is not None and bias.dtype == torch.float8_e4m3fn:
+                with _R20_FP8_CACHE_LOCK:
+                    _R20_FP8_CACHE_STATS["bias_widenings"] += 1
+                bias = _upcast_and_round(bias, torch.bfloat16, False, layer._seed)
+            nbytes = 0 if bias is None else bias.numel() * bias.element_size()
+            new_entry = _R20Fp8CacheEntry(key, prepacked_weight, bias, nbytes)
+            with _R20_FP8_CACHE_LOCK:
+                _r20_admit_entry_locked(layer, identifier, new_entry)
+            _R20_FP8_CACHE_STATS["direct_calls"] += 1
+
+    scale, zero_point = _r20_qparams(input.device)
+    matrix = input if input.dim() == 2 else input.reshape(-1, input.shape[-1])
+    if not matrix.is_contiguous():
+        matrix = matrix.contiguous()
+    output = _R20_QPOINTWISE(
+        matrix,
+        1.0,
+        0,
+        prepacked_weight,
+        scale,
+        zero_point,
+        bias,
+        1.0,
+        0,
+        torch.bfloat16,
+        "none",
+        [],
+        "none",
+    )
+    return output.reshape(*input.shape[:-1], output.shape[-1])
+
+
+# --- R4 (additive): bounded per-layer bf16 cache for fp8 -> bf16 upcast (Scheme C).
+#
+# Off by default. Set ``LTX_R4_FP8CACHE=1`` to enable; unset or ``=0`` keeps the
+# original path bit-for-bit. ``LTX_ALL_ORIG=1`` also forces the original path
+# (round-0 baseline, same convention as the R1/R2/R3/R5/R6 switches).
+_R4_FP8CACHE_BUDGET_BYTES = 5 * 1024**3  # 5 GiB total across all layers
+_R4_FP8CACHE_MIN_NUMEL = 4096  # smaller tensors skip the cache (recomputed directly)
+
+_r4_fp8cache_used_bytes = 0
+_r4_fp8cache_lock = threading.Lock()
+
+
+def _r4_fp8cache_enabled() -> bool:
+    """True only when the R4 cache is explicitly switched on."""
+    if os.environ.get("LTX_ALL_ORIG", "0") == "1":
+        return False
+    return os.environ.get("LTX_R4_FP8CACHE", "0") == "1"
+
+
+def _r4_cache_key(source: torch.Tensor, target_dtype: torch.dtype) -> tuple:
+    """Identity of an upcast result: source storage + version + shape + dtypes.
+
+    Inference tensors (``torch.is_inference``) carry no version counter and
+    are immutable, so the key omits ``_version`` for them and relies on
+    data_ptr / shape / dtype / device.
+    """
+    if torch.is_inference(source):
+        return (
+            source.data_ptr(),
+            tuple(source.shape),
+            source.dtype,
+            str(source.device),
+            target_dtype,
+        )
+    return (
+        source.data_ptr(),
+        source._version,
+        tuple(source.shape),
+        source.dtype,
+        str(source.device),
+        target_dtype,
+    )
+
+
+def _r4_cached_upcast(
+    layer: torch.nn.Linear,
+    slot: str,
+    source: torch.Tensor,
+    target_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return ``source.to(target_dtype)`` via the per-layer bounded bf16 cache.
+
+    * Hit (same key): return the stored bf16 tensor (bitwise identical).
+    * Small tensors (``numel < _R4_FP8CACHE_MIN_NUMEL``): computed directly,
+      never stored.
+    * Miss: compute directly, then admit only if the 5 GiB budget still holds;
+      over budget the fresh tensor is returned without storing (fallback).
+    * Errors are never swallowed: only the budget gate triggers the fallback.
+    """
+    global _r4_fp8cache_used_bytes
+    if source.numel() < _R4_FP8CACHE_MIN_NUMEL:
+        return source.to(target_dtype)
+    key = _r4_cache_key(source, target_dtype)
+    entry = getattr(layer, slot, None)
+    if entry is not None and entry[0] == key:
+        cached = entry[1]
+        if cached.dtype == target_dtype and tuple(cached.shape) == tuple(source.shape):
+            return cached
+    fresh = source.to(target_dtype)
+    fresh_bytes = fresh.numel() * fresh.element_size()
+    with _r4_fp8cache_lock:
+        old = getattr(layer, slot, None)
+        if old is not None:
+            _r4_fp8cache_used_bytes -= old[1].numel() * old[1].element_size()
+        if _r4_fp8cache_used_bytes + fresh_bytes <= _R4_FP8CACHE_BUDGET_BYTES:
+            _r4_fp8cache_used_bytes += fresh_bytes
+            setattr(layer, slot, (key, fresh))
+        else:
+            # Over budget: fall back to the direct result; store nothing.
+            setattr(layer, slot, None)
+    return fresh
 
 
 class Fp8CastLinear(torch.nn.Linear):
@@ -107,6 +531,75 @@ class Fp8CastLinear(torch.nn.Linear):
     _seed: int
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:  # noqa: A002, type: ignore[override]
+        if (
+            _r18_fp8_bf16_cache_enabled()
+            and not self._with_stochastic_rounding
+            and input.dtype == torch.bfloat16
+            and self.weight.dtype == torch.float8_e4m3fn
+            and (self.bias is None or self.bias.dtype == torch.float8_e4m3fn)
+            and not torch.is_grad_enabled()
+        ):
+            _R18_FP8_BF16_CACHE_STATS["calls"] += 1
+            weight_up = _r18_cached_bf16_upcast(
+                self, "_r18_w_up", self.weight, input.dtype, self._seed
+            )
+            bias_up = (
+                _r18_cached_bf16_upcast(
+                    self, "_r18_b_up", self.bias, input.dtype, self._seed
+                )
+                if self.bias is not None
+                else None
+            )
+            return torch.nn.functional.linear(input, weight_up, bias_up)
+        if (
+            _r20_fp8_cache_enabled()
+            and not self._with_stochastic_rounding
+            and os.environ.get("LTX_R18_SYCLEFF", "0") != "1"
+            and not torch.is_grad_enabled()
+        ):
+            direct_output = _r20_direct_fp8_linear(self, input)
+            if direct_output is not None:
+                return direct_output
+        if _r4_fp8cache_enabled() and not self._with_stochastic_rounding:
+            # R4 (Scheme C): per-layer bounded bf16 cache for the fp8 -> bf16
+            # upcast. Stochastic rounding bypasses the cache (each call draws
+            # a new sample); small and over-budget tensors fall back to the
+            # direct conversion inside _r4_cached_upcast.
+            w_up = _r4_cached_upcast(self, "_r4_w_up", self.weight, input.dtype)
+            b_up = (
+                _r4_cached_upcast(self, "_r4_b_up", self.bias, input.dtype)
+                if self.bias is not None
+                else None
+            )
+            return torch.nn.functional.linear(input, w_up, b_up)
+        if (
+            not self._with_stochastic_rounding
+            and input.dtype == torch.bfloat16
+            and self.weight.dtype == torch.float8_e4m3fn
+            and (self.bias is None or self.bias.dtype == torch.float8_e4m3fn)
+        ):
+            from ltx_core.model.transformer.r8_sycl import (
+                r18_sycleff_on,
+                r9a_fp8_widen_batch,
+                r9a_fp8_widen_pair,
+            )
+
+            if r18_sycleff_on():
+                descriptors = [self.weight]
+                if self.bias is not None:
+                    descriptors.append(self.bias)
+                batch = r9a_fp8_widen_batch(descriptors)
+                if batch is not None:
+                    return torch.nn.functional.linear(
+                        input, batch[0], batch[1] if self.bias is not None else None
+                    )
+            # R41: one batch launch for the weight and its bias, independent of
+            # LTX_R18_SYCLEFF. The two tensors are independent upcasts, so a single
+            # R8Fp8WidenBatchKernel launch replaces two, removing one launch per
+            # bias-bearing fp8 linear.
+            pair = r9a_fp8_widen_pair(self.weight, self.bias)
+            if pair is not None:
+                return torch.nn.functional.linear(input, pair[0], pair[1])
         w_up = _upcast_and_round(self.weight, input.dtype, self._with_stochastic_rounding, self._seed)
         b_up = (
             _upcast_and_round(self.bias, input.dtype, self._with_stochastic_rounding, self._seed)
@@ -114,7 +607,6 @@ class Fp8CastLinear(torch.nn.Linear):
             else None
         )
         return torch.nn.functional.linear(input, w_up, b_up)
-
 
 def _replace_fwd_with_upcast(layer: torch.nn.Linear, with_stochastic_rounding: bool = False, seed: int = 0) -> None:
     """

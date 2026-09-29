@@ -69,6 +69,8 @@ def synchronize_device(device: DeviceSpec = None) -> None:
         torch.cuda.synchronize(resolved)
     elif resolved.type == "mps" and is_mps_available():
         torch.mps.synchronize()
+    elif resolved.type == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
+        torch.xpu.synchronize(resolved)
 
 
 def empty_device_cache(device: DeviceSpec = None) -> None:
@@ -78,6 +80,8 @@ def empty_device_cache(device: DeviceSpec = None) -> None:
         torch.cuda.empty_cache()
     elif resolved.type == "mps" and is_mps_available():
         torch.mps.empty_cache()
+    elif resolved.type == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
+        torch.xpu.empty_cache()
 
 
 def cuda_activation_budget_bytes(device: DeviceSpec = None) -> int:
@@ -121,6 +125,24 @@ def mps_activation_budget_bytes(device: DeviceSpec = None) -> int:
     return max(0, recommended - allocated)
 
 
+def xpu_activation_budget_bytes(device: DeviceSpec = None) -> int:
+    """Bytes still available for new XPU allocations in this process.
+    Mirrors the CUDA probe: ``fraction * device_total - memory_reserved``, capped by raw free.
+    """
+    if not hasattr(torch, "xpu") or not torch.xpu.is_available():
+        return 0
+    resolved = resolve_device(device)
+    if resolved.type != "xpu":
+        return 0
+    idx = resolved.index if resolved.index is not None else torch.xpu.current_device()
+    free_raw, _total_raw = torch.xpu.mem_get_info(idx)
+    props_total = torch.xpu.get_device_properties(idx).total_memory
+    fraction = torch.xpu.get_per_process_memory_fraction(idx)
+    reserved = torch.xpu.memory_reserved(idx)
+    under_fraction = max(0, int(fraction * props_total) - int(reserved))
+    return min(int(free_raw), under_fraction)
+
+
 def activation_budget_bytes(device: DeviceSpec = None) -> int:
     """Bytes available for new activations on *device*, across backends.
     Use this rather than the per-backend helpers when sizing work to fit in memory
@@ -135,6 +157,8 @@ def activation_budget_bytes(device: DeviceSpec = None) -> int:
         return cuda_activation_budget_bytes(resolved)
     if resolved.type == "mps":
         return mps_activation_budget_bytes(resolved)
+    if resolved.type == "xpu":
+        return xpu_activation_budget_bytes(resolved)
     return 0
 
 

@@ -1,5 +1,6 @@
 import functools
 import math
+import os
 from enum import Enum
 from typing import Callable, Tuple
 
@@ -40,9 +41,94 @@ def apply_interleaved_rotary_emb(
     return out
 
 
+def _env_on(name, default="1"):
+    # Central env helper: LTX_ALL_ORIG=1 forces round-0 (all fall back to original paths).
+    if os.environ.get("LTX_ALL_ORIG", "0") == "1":
+        return False
+    return os.environ.get(name, default) != "0"
+
+
+def _apply_split_rotary_emb_negfold(
+    input_tensor: torch.Tensor, cos_freqs: torch.Tensor, sin_freqs: torch.Tensor
+) -> torch.Tensor:
+    """R5 O2 (LTX_R5_FUSE=1): neg-folded variant of apply_split_rotary_emb.
+
+    Bitwise identical to the default path; folds the `-sin` negation into
+    `addcmul(value=-1)` to remove one elementwise (neg) kernel launch per call.
+    """
+    if sin_freqs.shape != cos_freqs.shape:
+        raise ValueError(
+            f"apply_split_rotary_emb: sin_freqs.shape {tuple(sin_freqs.shape)} must equal "
+            f"cos_freqs.shape {tuple(cos_freqs.shape)}."
+        )
+    needs_reshape = input_tensor.ndim != 4 and cos_freqs.ndim == 4
+    if needs_reshape:
+        b_freq = cos_freqs.shape[0]
+        h = cos_freqs.shape[1]
+        b_in = input_tensor.shape[0]
+        if b_freq not in (1, b_in):
+            raise ValueError(
+                f"apply_split_rotary_emb: cos_freqs batch ({b_freq}) must be 1 "
+                f"(broadcast) or equal input_tensor batch ({b_in})."
+            )
+        # `unflatten` only touches the last dim, keeping the batch and seq dims as
+        # the input tensor's own symbolic ints under torch.compile. `reshape(b_in,
+        # t, h, -1)` would have forced Dynamo to specialise those dims because it
+        # cannot prove `b_in == cos_freqs.shape[0]` and `seq == t` across tensors.
+        input_tensor = input_tensor.unflatten(-1, (h, -1)).transpose(1, 2)
+
+    split_input = rearrange(input_tensor, "... (d r) -> ... d r", d=2)
+    first_half_input = split_input[..., :1, :]
+    second_half_input = split_input[..., 1:, :]
+
+    output = split_input * cos_freqs.unsqueeze(-2)
+    first_half_output = output[..., :1, :]
+    second_half_output = output[..., 1:, :]
+
+    sin_expanded = sin_freqs.unsqueeze(-2)
+    first_half_output.addcmul_(sin_expanded, second_half_input, value=-1.0)
+    second_half_output.addcmul_(sin_expanded, first_half_input)
+
+    output = rearrange(output, "... d r -> ... (d r)")
+    if needs_reshape:
+        # `transpose(1, 2).flatten(-2)` keeps the batch and seq dims symbolic; using
+        # `reshape(b_in, t, -1)` would force Dynamo to specialise both axes.
+        output = output.transpose(1, 2).flatten(-2)
+
+    return output
+def _r8_rope_ok(
+    input_tensor: torch.Tensor, cos_freqs: torch.Tensor, sin_freqs: torch.Tensor
+) -> bool:
+    # R8 (additive): cheap gate for the SYCL fused negfold; the callee
+    # revalidates fully (and loads the .so) before firing.
+    from ltx_core.model.transformer.r8_sycl import r8_on as _r8_on  # noqa: PLC0415
+
+    return (
+        _r8_on()
+        and cos_freqs.ndim == 4
+        and (input_tensor.ndim == 4 or input_tensor.ndim == 3)
+        and input_tensor.is_xpu
+        and cos_freqs.is_xpu
+        and sin_freqs.is_xpu
+        and input_tensor.dtype == torch.bfloat16
+        and cos_freqs.dtype == torch.bfloat16
+        and sin_freqs.dtype == torch.bfloat16
+    )
+
+
 def apply_split_rotary_emb(
     input_tensor: torch.Tensor, cos_freqs: torch.Tensor, sin_freqs: torch.Tensor
 ) -> torch.Tensor:
+    # R8 (additive): SYCL fused split-rope negfold (mul + 2 x addcmul_ -> 1).
+    # LTX_R8_SYCL=0 (or LTX_ALL_ORIG=1) keeps the path below bitwise.
+    if _r8_rope_ok(input_tensor, cos_freqs, sin_freqs):
+        from ltx_core.model.transformer.r8_sycl import r8_split_rope  # noqa: PLC0415
+
+        return r8_split_rope(input_tensor, cos_freqs, sin_freqs)
+    # R5 (additive): neg-fold path is the default; LTX_R5_FUSE=0 restores the original path.
+    # LTX_ALL_ORIG=1 also forces the original path (round-0 baseline).
+    if _env_on("LTX_R5_FUSE"):
+        return _apply_split_rotary_emb_negfold(input_tensor, cos_freqs, sin_freqs)
     if sin_freqs.shape != cos_freqs.shape:
         raise ValueError(
             f"apply_split_rotary_emb: sin_freqs.shape {tuple(sin_freqs.shape)} must equal "

@@ -85,3 +85,8 @@ wandb/
 
 # Binary files
 *.so
+
+# SYCL kernel build intermediates
+*.o
+*.bc
+*.spv

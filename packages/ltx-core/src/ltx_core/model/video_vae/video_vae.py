@@ -673,11 +673,11 @@ def map_spatial_interval_to_latent(
 
 
 from ltx_core.model.video_vae.conv_video_decoder import ConvVideoDecoder  # noqa: E402
-from ltx_core.model.video_vae.diffusion_video_decoder import DiffusionVideoDecoder  # noqa: E402
+# DISABLED: from ltx_core.model.video_vae.diffusion_video_decoder import DiffusionVideoDecoder  # noqa: E402
 
 __all__ = [
     "ConvVideoDecoder",
-    "DiffusionVideoDecoder",
+    # DISABLED: "DiffusionVideoDecoder",
     "VideoDecoder",
     "VideoEncoder",
     "get_video_chunks_number",

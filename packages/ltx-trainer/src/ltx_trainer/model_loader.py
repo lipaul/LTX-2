@@ -210,14 +210,17 @@ def load_video_vae_decoder(
         is_diffusion_video_vae,
         video_decoder_sd_ops_for_checkpoint,
     )
-    from ltx_core.model.video_vae.transformer import build_cutlass_fna_diffusion_decoder_op
+    # DISABLED: from ltx_core.model.video_vae.transformer import build_cutlass_fna_diffusion_decoder_op
 
     checkpoint_path = str(checkpoint_path)
 
     # ChunkedEager ModuleOps: deferred stage-4 + W-chunking + cutlass-fna; lower
     # peak VRAM than CombinedCompile during validation decode.
     diffusion_vae = is_diffusion_video_vae(checkpoint_path)
-    module_ops = (build_cutlass_fna_diffusion_decoder_op(),) if diffusion_vae else ()
+    if diffusion_vae:
+        # DISABLED: the diffusion video decoder is removed from this product path.
+        raise NotImplementedError("diffusion video VAE is disabled")
+    module_ops = ()
 
     return SingleGPUModelBuilder(
         model_path=checkpoint_path,

@@ -40,10 +40,10 @@ from ltx_core.model.transformer.modality import Modality
 from ltx_core.model.transformer.model import X0Model
 from ltx_core.model.video_vae import DimensionSizeConfig, TileSizeConfig
 from ltx_core.model.video_vae.diffusion_tiling import recommended_decode_tiling_config
-from ltx_core.model.video_vae.diffusion_video_decoder import DiffusionVideoDecoder
+# DISABLED: from ltx_core.model.video_vae.diffusion_video_decoder import DiffusionVideoDecoder
 from ltx_core.model.video_vae.model_configurator import (
-    diffvae_tiling_geometry_from_vae_config,
-    estimate_diffusion_decoder_weight_bytes,
+    # DISABLED: diffvae_tiling_geometry_from_vae_config,
+    # DISABLED: estimate_diffusion_decoder_weight_bytes,
 )
 from ltx_core.model.video_vae.transformer.config import DiffVAEMode
 from ltx_core.tools import AudioLatentTools, VideoLatentTools
