@@ -2,12 +2,12 @@
 A keyframe-aware decode carries two streams through the decoder: the video volume
 ``(B, T, H, W, C)`` and a stack of keyframe *planes* ``(B, P, H, W, C)`` whose plane
 axis occupies video's temporal slot. Weights are fully shared; the streams only ever
-mix inside one joint attention softmax (see ``transformer/fallback_na/joint_eager.py``).
+mix inside one joint attention softmax.
 Everything here is pure coordinate/geometry math with no module state, so the eager and
 triton backends can share it and therefore agree exactly on slot selection.
 Deviation from upstream worth knowing: upstream carries per-sample keyframe times and
 masks (``(B, n_kf)``). Here they are batch-shared 1-D ``(P,)`` tensors, because our
-decode path is single-sample and ``rope_math.rot_abs_axis_impl`` takes a 1-D position
+decode path is single-sample and the absolute-axis RoPE helper takes a 1-D position
 vector per axis. That keeps the RoPE call and the slot tables batch-independent.
 """
 

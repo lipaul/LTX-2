@@ -500,10 +500,7 @@ class DiffusionStage:
 
     def _build_transformer(self, *, device: torch.device | None = None, **kwargs: object) -> X0Model:
         target = device or self._device
-        model = X0Model(self._prepared_builder().build(device=target, **kwargs)).to(target).eval()
-        from ltx_core.model.transformer.r9b_qkv import maybe_fuse_qkv
-        from ltx_core.model.transformer.r25_qkv import maybe_fuse_video_self_qkv
-        return maybe_fuse_video_self_qkv(maybe_fuse_qkv(model))
+        return X0Model(self._prepared_builder().build(device=target, **kwargs)).to(target).eval()
 
     @property
     def _is_streaming(self) -> bool:

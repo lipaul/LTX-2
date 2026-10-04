@@ -71,80 +71,10 @@ if TYPE_CHECKING:
 
 
 def _env_on(name, default="1"):
-    # Central env helper: LTX_ALL_ORIG=1 forces round-0 (all fall back).
-    if os.environ.get("LTX_ALL_ORIG", "0") == "1":
+    # Central env helper: LTX_ORIGINAL_PATH=1 routes every path back to plain torch ops.
+    if os.environ.get("LTX_ORIGINAL_PATH", "0") == "1":
         return False
     return os.environ.get(name, default) != "0"
-
-
-def r39_layout_on() -> bool:
-    """Return whether the R39 per-site convolution memory layout is in effect.
-
-    The decision covers the non-causal in-place convolution path, which is the path a
-    ``causal_decoder: false`` checkpoint selects.  With the flag off every workspace keeps
-    the channels_last_3d layout this module allocates today.
-    """
-    if os.environ.get("LTX_ALL_ORIG", "0") == "1":
-        return False
-    value = os.environ.get("LTX_R39_CONV_LAYOUT", "0")
-    if value not in {"0", "1"}:
-        raise ValueError("LTX_R39_CONV_LAYOUT must be 0 or 1")
-    return value == "1"
-
-
-def r39_layout_channel_threshold() -> int:
-    """Input-channel count at or above which a convolution runs on a contiguous workspace.
-
-    ``LTX_R39_CONV_LAYOUT_CH`` sets the threshold.  A site with fewer input channels keeps
-    ``channels_last_3d``; at or above it the workspace and the weight are both contiguous.
-
-    The default is 1, i.e. EVERY site runs contiguous.  That is not a guess: on real bf16 weights
-    with the conversions included in the timing, the contiguous layout beat ``channels_last_3d`` at
-    all seven measured sites and at every input-channel level (1024, 512, 256, 128), by 100.9 %, 80.2 %,
-    11.8 %, 10.4 %, 8.9 %, 3.6 % and 1.8 % respectively (bench/clast-res/sweep.json).  The previous
-    default of 512 therefore left 48.9 % of the decoder's convolution FLOPs on the slower layout.
-    The threshold remains a knob so a future site can opt out, and ``LTX_ALL_ORIG=1`` still returns
-    the round-0 behaviour regardless.
-    """
-    if os.environ.get("LTX_ALL_ORIG", "0") == "1":
-        return 1 << 30
-    value = int(os.environ.get("LTX_R39_CONV_LAYOUT_CH", "1"))
-    if value < 1:
-        raise ValueError("LTX_R39_CONV_LAYOUT_CH must be >= 1")
-    return value
-
-
-def _contiguous_weight(conv: nn.Conv3d) -> torch.Tensor:
-    """Return a contiguous (NCDHW) copy of *conv*'s weight, built once per convolution.
-
-    Weights arrive in ``channels_last_3d``.  A convolution whose workspace runs contiguous
-    needs its weight contiguous too, and ``clone`` / ``contiguous`` on a channels_last_3d
-    tensor preserves that layout, so the copy is made through an explicit reshape.  The
-    cache is keyed on the source weight's identity, device and dtype, so a module moved or
-    reloaded after the first call rebuilds it.
-    """
-    w = conv.weight
-    key = (w.data_ptr(), w.shape, w.stride(), w.device, w.dtype)
-    cache = getattr(conv, "_r39_contiguous_weight", None)
-    if cache is not None and cache[0] == key:
-        return cache[1]
-    out = w.detach().to(memory_format=torch.contiguous_format)
-    conv._r39_contiguous_weight = (key, out)  # type: ignore[attr-defined]
-    return out
-
-
-def _conv_memory_format(conv: nn.Conv3d) -> torch.memory_format:
-    """Workspace layout for *conv*: contiguous at or above the channel threshold, else channels_last_3d."""
-    if conv.in_channels >= r39_layout_channel_threshold():
-        return torch.contiguous_format
-    return torch.channels_last_3d
-
-
-def _conv_weight(conv: nn.Conv3d) -> torch.Tensor:
-    """Weight tensor matching :func:`_conv_memory_format` for *conv*."""
-    if conv.in_channels >= r39_layout_channel_threshold():
-        return _contiguous_weight(conv)
-    return conv.weight
 
 
 def _memory_format_of(t: torch.Tensor, prefer_channels_last_3d: bool = False) -> torch.memory_format:
@@ -347,37 +277,36 @@ def _causal_pad_free_and_conv(x: torch.Tensor, causal_conv: CausalConv3d) -> tor
 # ---------------------------------------------------------------------------
 
 
-def _r40_bcast_on() -> bool:
-    """Explicit gate for the R40 broadcast kernel.
+def _bcast_div_enabled() -> bool:
+    """Explicit gate for the broadcast kernel.
 
-    The value is validated before LTX_ALL_ORIG is consulted, so a typo is
+    The value is validated before LTX_ORIGINAL_PATH is consulted, so a typo is
     reported even when the feature is globally disabled; a configuration error
-    should not hide until someone turns the feature on.  Once validated,
-    LTX_ALL_ORIG=1 forces the round-0 baseline and LTX_R40_BBCAST=0 is the
-    default, so the original torch path runs unless the flag is explicitly 1.
+    should not hide until someone turns the feature on.  LTX_ORIGINAL_PATH=1 forces
+    the baseline (plain torch); LTX_SYCL_BCAST_DIV=0 selects the plain torch path.
     """
-    value = os.environ.get("LTX_R40_BBCAST", "0")
+    value = os.environ.get("LTX_SYCL_BCAST_DIV", "1")
     if value not in {"0", "1"}:
-        raise ValueError("LTX_R40_BBCAST must be 0 or 1")
-    if os.environ.get("LTX_ALL_ORIG", "0") == "1":
+        raise ValueError("LTX_SYCL_BCAST_DIV must be 0 or 1")
+    if os.environ.get("LTX_ORIGINAL_PATH", "0") == "1":
         return False
     return value == "1"
 
 
-def _r40_bcast_inplace(x, operand, outer, inner, operand_strides, op) -> bool:
+def _bcast_inplace(x, operand, outer, inner, operand_strides, op) -> bool:
     """In-place bf16 mul (op 0) or div (op 1) against a stride-broadcast operand.
 
-    Returns True when R8BBcastKernel performed the update, False when the inputs
+    Returns True when performed the update, False when the inputs
     are outside what it supports, in which case the caller uses its own
     expression.  Both False cases are decided here, before any call, and cover
     only supported-input questions: the flag, device, dtype, rank and element
     count.  Nothing raised by the op is caught, so a kernel that cannot run
     surfaces instead of quietly selecting a different numerical path.
 
-    The op is resolved through ``torch.ops.libr8`` rather than the r8_sycl python
+    The op is resolved through ``torch.ops.ltx_sycl`` rather than the sycl_kernels python
     wrapper so this file does not depend on a module another agent rewrites.
     """
-    if not _r40_bcast_on():
+    if not _bcast_div_enabled():
         return False
     if not (x.is_xpu and operand.is_xpu):
         return False
@@ -397,7 +326,7 @@ def _r40_bcast_inplace(x, operand, outer, inner, operand_strides, op) -> bool:
             and stride[2] == h * w * inner
             and stride[0] == t * h * w * inner
             and x.data_ptr() % 16 == 0):
-        torch.ops.libr8.r40_bcast_inplace(x, operand, list(outer), int(inner),
+        torch.ops.ltx_sycl.bcast_inplace(x, operand, list(outer), int(inner),
                                           list(operand_strides), int(op))
         return True
     # Strided view, e.g. workspace[:, :, 1:-1] at all three production sites:
@@ -407,7 +336,7 @@ def _r40_bcast_inplace(x, operand, outer, inner, operand_strides, op) -> bool:
     # error raised by the op itself is not caught.
     if stride[1] == 1 and x.data_ptr() % 16 == 0:
         xstrides = [stride[0], stride[2], stride[3], stride[4]]
-        torch.ops.libr8.r40_bcast_strided_inplace(
+        torch.ops.ltx_sycl.bcast_strided_inplace(
             x, operand, list(outer), int(inner), xstrides,
             list(operand_strides), int(op))
         return True
@@ -419,15 +348,15 @@ def _pixel_norm_inplace(x: torch.Tensor, eps: float = 1e-8) -> None:
 
     ``rms`` is [B, 1, T, H, W] while ``x`` is [B, C, T, H, W] in channels_last_3d,
     so the divide's divisor has a zero stride on the innermost run and PyTorch
-    selects the scalar ElementwiseGlobalRange path for it.  LTX_R40_BBCAST=1
-    routes the divide through the vectorised R8BBcastKernel, which is bitwise
+    selects the scalar ElementwiseGlobalRange path for it.  LTX_SYCL_BCAST_DIV=1
+    routes the divide through the vectorised, which is bitwise
     with DivFunctor<BFloat16>.  Anything unsupported is decided before the call
     and takes ``x.div_(rms)``; an error raised by the op is not caught.
     """
     rms = torch.sqrt(torch.mean(x**2, dim=1, keepdim=True) + eps)
     if x.dim() == 5:
         b, c, t, h, w = x.shape
-        if _r40_bcast_inplace(x, rms, (b, t, h, w), c, (t * h * w, h * w, w, 1, 0), 1):
+        if _bcast_inplace(x, rms, (b, t, h, w), c, (t * h * w, h * w, w, 1, 0), 1):
             return
     x.div_(rms)
 
@@ -496,7 +425,7 @@ def _resnet_block_forward_inplace(
         del result
     else:
         inplace_conv3d_temporal_chunked(
-            workspace, resnet.conv1.conv, _conv_weight(resnet.conv1.conv) if r39_layout_on() else None
+            workspace, resnet.conv1.conv, None
         )
 
     if resnet.inject_noise:
@@ -520,7 +449,7 @@ def _resnet_block_forward_inplace(
         del result
     else:
         inplace_conv3d_temporal_chunked(
-            workspace, resnet.conv2.conv, _conv_weight(resnet.conv2.conv) if r39_layout_on() else None
+            workspace, resnet.conv2.conv, None
         )
 
     if resnet.inject_noise:
@@ -555,10 +484,7 @@ def _midblock_forward_efficient(
         )
         timestep_embed = timestep_embed.view(batch_size, timestep_embed.shape[-1], 1, 1, 1)
 
-    if r39_layout_on() and block.res_blocks:
-        mem_fmt = _conv_memory_format(block.res_blocks[0].conv1.conv)
-    else:
-        mem_fmt = _memory_format_of(hidden_states, prefer_channels_last_3d)
+    mem_fmt = _memory_format_of(hidden_states, prefer_channels_last_3d)
     workspace = torch.empty(
         hidden_states.shape[0],
         hidden_states.shape[1],
@@ -573,8 +499,8 @@ def _midblock_forward_efficient(
     # Bridge the layout gap: hidden arrives NCDHW (upsample emits NCHW-default)
     # but the workspace slice is channels_last_3d. Same-layout operands let
     # the XPU elementwise path vectorize instead of scalar fallback.
-    # LTX_R1_LAYOUT=0 (or LTX_ALL_ORIG=1) skips the conversion (round-0 layout).
-    if _env_on("LTX_R1_LAYOUT") and not hidden_states.is_contiguous(memory_format=mem_fmt):
+    # LTX_VAE_LAYOUT_CONVERT=0 (or LTX_ORIGINAL_PATH=1) skips the conversion (baseline layout, plain torch).
+    if _env_on("LTX_VAE_LAYOUT_CONVERT") and not hidden_states.is_contiguous(memory_format=mem_fmt):
         hidden_states = hidden_states.to(memory_format=mem_fmt)
 
     for resnet in block.res_blocks:
@@ -618,12 +544,8 @@ def _upsample_forward_efficient(
     if causal:
         x = _causal_pad_free_and_conv(x, block.conv)
     else:
-        if r39_layout_on():
-            mem_fmt = _conv_memory_format(conv)
-            weight = _conv_weight(conv)
-        else:
-            mem_fmt = _memory_format_of(x, prefer_channels_last_3d)
-            weight = conv.weight
+        mem_fmt = _memory_format_of(x, prefer_channels_last_3d)
+        weight = conv.weight
         workspace = torch.empty(
             x.shape[0],
             max(in_channels, out_channels),
@@ -652,14 +574,6 @@ def _upsample_forward_efficient(
     if block.residual:
         x.add_(x_in)
         del x_in
-    # R9C: emit channels_last_3d so the next midblock R1 .to() is a no-op
-    # and the workspace fill sees same-layout operands (kills the
-    # transcription Legacy copy).
-    # 2026-09-24 裁定：R9C 效益不可重現（同窗開/關逐位相同），改為**預設關**。
-    # LTX_R9C_LAYOUT=1 可開；未設＝預設關（canonical）；LTX_ALL_ORIG=1 亦關。
-    if _env_on("LTX_R9C_LAYOUT", "0"):
-        if x.dim() == 5 and not x.is_contiguous(memory_format=torch.channels_last_3d):
-            x = x.to(memory_format=torch.channels_last_3d)
     return x
 
 
@@ -681,10 +595,7 @@ def _final_norm_and_conv_out(
     conv_out = conv_out_mod.conv
     feature_channels = sample.shape[1]
 
-    if r39_layout_on():
-        mem_fmt = _conv_memory_format(conv_out)
-    else:
-        mem_fmt = _memory_format_of(sample, prefer_channels_last_3d)
+    mem_fmt = _memory_format_of(sample, prefer_channels_last_3d)
     workspace = torch.empty(
         sample.shape[0],
         max(feature_channels, conv_out.out_channels),
@@ -731,7 +642,7 @@ def _final_norm_and_conv_out(
         del padded
     else:
         inplace_conv3d_temporal_chunked(
-            workspace, conv_out, _conv_weight(conv_out) if r39_layout_on() else None
+            workspace, conv_out, None
         )
         result = workspace[:, : conv_out.out_channels, 1:-1].contiguous(memory_format=mem_fmt)
         del workspace, interior

@@ -42,8 +42,8 @@ def apply_interleaved_rotary_emb(
 
 
 def _env_on(name, default="1"):
-    # Central env helper: LTX_ALL_ORIG=1 forces round-0 (all fall back to original paths).
-    if os.environ.get("LTX_ALL_ORIG", "0") == "1":
+    # Central env helper: LTX_ORIGINAL_PATH=1 routes every path back to plain torch ops.
+    if os.environ.get("LTX_ORIGINAL_PATH", "0") == "1":
         return False
     return os.environ.get(name, default) != "0"
 
@@ -51,7 +51,7 @@ def _env_on(name, default="1"):
 def _apply_split_rotary_emb_negfold(
     input_tensor: torch.Tensor, cos_freqs: torch.Tensor, sin_freqs: torch.Tensor
 ) -> torch.Tensor:
-    """R5 O2 (LTX_R5_FUSE=1): neg-folded variant of apply_split_rotary_emb.
+    """ O2 (LTX_FUSE_ROPE_NEGFOLD=1): neg-folded variant of apply_split_rotary_emb.
 
     Bitwise identical to the default path; folds the `-sin` negation into
     `addcmul(value=-1)` to remove one elementwise (neg) kernel launch per call.
@@ -96,15 +96,15 @@ def _apply_split_rotary_emb_negfold(
         output = output.transpose(1, 2).flatten(-2)
 
     return output
-def _r8_rope_ok(
+def _rope_kernel_ok(
     input_tensor: torch.Tensor, cos_freqs: torch.Tensor, sin_freqs: torch.Tensor
 ) -> bool:
-    # R8 (additive): cheap gate for the SYCL fused negfold; the callee
+    # Cheap gate for the SYCL fused negfold; the callee
     # revalidates fully (and loads the .so) before firing.
-    from ltx_core.model.transformer.r8_sycl import r8_on as _r8_on  # noqa: PLC0415
+    from ltx_core.model.transformer.sycl_kernels import sycl_enabled as _sycl_enabled  # noqa: PLC0415
 
     return (
-        _r8_on()
+        _sycl_enabled()
         and cos_freqs.ndim == 4
         and (input_tensor.ndim == 4 or input_tensor.ndim == 3)
         and input_tensor.is_xpu
@@ -119,15 +119,15 @@ def _r8_rope_ok(
 def apply_split_rotary_emb(
     input_tensor: torch.Tensor, cos_freqs: torch.Tensor, sin_freqs: torch.Tensor
 ) -> torch.Tensor:
-    # R8 (additive): SYCL fused split-rope negfold (mul + 2 x addcmul_ -> 1).
-    # LTX_R8_SYCL=0 (or LTX_ALL_ORIG=1) keeps the path below bitwise.
-    if _r8_rope_ok(input_tensor, cos_freqs, sin_freqs):
-        from ltx_core.model.transformer.r8_sycl import r8_split_rope  # noqa: PLC0415
+    # SYCL fused split-rope negfold (mul + 2 x addcmul_ -> 1).
+    # LTX_SYCL_KERNELS=0 (or LTX_ORIGINAL_PATH=1) keeps the path below bitwise.
+    if _rope_kernel_ok(input_tensor, cos_freqs, sin_freqs):
+        from ltx_core.model.transformer.sycl_kernels import split_rope  # noqa: PLC0415
 
-        return r8_split_rope(input_tensor, cos_freqs, sin_freqs)
-    # R5 (additive): neg-fold path is the default; LTX_R5_FUSE=0 restores the original path.
-    # LTX_ALL_ORIG=1 also forces the original path (round-0 baseline).
-    if _env_on("LTX_R5_FUSE"):
+        return split_rope(input_tensor, cos_freqs, sin_freqs)
+    # The neg-fold path is the default; LTX_FUSE_ROPE_NEGFOLD=0 uses the two-step multiply form.
+    # LTX_ORIGINAL_PATH=1 forces the same plain-torch path.
+    if _env_on("LTX_FUSE_ROPE_NEGFOLD"):
         return _apply_split_rotary_emb_negfold(input_tensor, cos_freqs, sin_freqs)
     if sin_freqs.shape != cos_freqs.shape:
         raise ValueError(

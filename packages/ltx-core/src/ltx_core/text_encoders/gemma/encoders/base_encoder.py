@@ -28,12 +28,12 @@ GEMMA4_ENHANCE_GENERATION_KWARGS: dict[str, Any] = {
 }
 
 
-def _r23_gemma_enabled() -> bool:
-    if os.environ.get("LTX_ALL_ORIG", "0") == "1":
+def _gemma_xpu_enabled() -> bool:
+    if os.environ.get("LTX_ORIGINAL_PATH", "0") == "1":
         return False
-    value = os.environ.get("LTX_R23_GEMMA", "1")
+    value = os.environ.get("LTX_GEMMA_XPU", "1")
     if value not in {"0", "1"}:
-        raise ValueError("LTX_R23_GEMMA must be 0 or 1")
+        raise ValueError("LTX_GEMMA_XPU must be 0 or 1")
     return value == "1"
 
 
@@ -93,7 +93,7 @@ class LTXGemmaTextEncoder(torch.nn.Module, Disposable):
 
     def encode(self, prompts: list[str]) -> list[tuple[tuple[torch.Tensor, ...], torch.Tensor]]:
         """Run Gemma and return hidden states with the tokenizer sequence length.
-        The R23 path evaluates the valid left-padded suffix, preserves its absolute
+        The XPU path evaluates the valid left-padded suffix, preserves its absolute
         position IDs, and restores the fixed 1024-token output contract. The flag
         zero path evaluates the original padded batch.
         """
@@ -108,7 +108,7 @@ class LTXGemmaTextEncoder(torch.nn.Module, Disposable):
             [[w for _, w in pairs] for pairs in tokenized],
             device=self.model.device,
         )
-        if _r23_gemma_enabled():
+        if _gemma_xpu_enabled():
             hidden_states = self._encode_valid_token_crop(input_ids, attention_mask)
         else:
             outputs = self.model.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)

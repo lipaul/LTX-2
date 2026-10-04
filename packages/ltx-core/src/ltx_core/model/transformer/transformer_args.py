@@ -1,3 +1,4 @@
+import os
 from collections.abc import Callable, Hashable
 from dataclasses import dataclass, replace
 
@@ -20,6 +21,52 @@ from ltx_core.model.transformer.rope import (
 KeyframesEmbeddingProvider = Callable[[], torch.Tensor | None]
 
 
+def _sparse_keyframe_enabled() -> bool:
+    """ 稀疏 keyframe 加成開關。
+
+    ``LTX_ATTN_SPARSE_KEYFRAME=0`` 或 ``LTX_ORIGINAL_PATH=1`` 走一般的兩道運算式。預設 1。
+    """
+    if os.environ.get("LTX_ORIGINAL_PATH", "0") == "1":
+        return False
+    value = os.environ.get("LTX_ATTN_SPARSE_KEYFRAME", "1")
+    if value not in {"0", "1"}:
+        raise ValueError("LTX_ATTN_SPARSE_KEYFRAME must be 0 or 1")
+    return value == "1"
+
+
+_SPARSE_MASK_CACHE: dict[int, tuple[torch.Tensor, tuple[int, int, torch.Tensor | None] | None]] = {}
+_SPARSE_MASK_CACHE_MAX = 4
+
+
+def _sparse_keyframe_rows(keyframes_mask: torch.Tensor) -> tuple[int, int, torch.Tensor | None] | None:
+    """回傳被標記列的位置（把 B*T 攤平後），以及可用的最快形式。
+
+    成立的條件是標記列的占比不超過 1/4。回傳值的第三項為 ``None`` 代表標記列
+    連續，前兩項即為區間 ``[start, stop)``；若標記列分散則前兩項為 -1，第三項
+    是索引張量。不符條件時回 ``None``，呼叫端走原運算式。結果依 mask 物件快取，
+    快取至多保留最近 4 個物件並持有其參照，因此識別不會被回收後重複使用，也不會無限增長。標記由條件化一次產生，
+    之後只被讀取（推論模式下張量不記錄版本計數），所以同一物件的內容不變。
+    """
+    hit = _SPARSE_MASK_CACHE.get(id(keyframes_mask))
+    if hit is not None and hit[0] is keyframes_mask:
+        return hit[1]
+    found: tuple[int, int, torch.Tensor | None] | None = None
+    while len(_SPARSE_MASK_CACHE) >= _SPARSE_MASK_CACHE_MAX:
+        _SPARSE_MASK_CACHE.pop(next(iter(_SPARSE_MASK_CACHE)))
+    flat = (keyframes_mask > 0).reshape(-1)
+    marked = int(flat.sum().item())
+    if 0 < marked <= flat.numel() // 4:
+        idx = flat.nonzero().flatten()
+        contiguous = bool(torch.all(idx[1:] == idx[:-1] + 1).item()) if idx.numel() > 1 else True
+        if contiguous:
+            start = int(idx[0].item())
+            found = (start, start + marked, None)
+        else:
+            found = (-1, -1, idx)
+    _SPARSE_MASK_CACHE[id(keyframes_mask)] = (keyframes_mask, found)
+    return found
+
+
 def apply_keyframes_absolute_embedding(
     hidden_states: torch.Tensor,
     keyframes_mask: torch.Tensor | None,
@@ -39,8 +86,22 @@ def apply_keyframes_absolute_embedding(
     embedding = embedding_provider()
     if embedding is None:
         return hidden_states
+    emb = embedding.to(dtype=hidden_states.dtype)
+    if _sparse_keyframe_enabled():
+        found = _sparse_keyframe_rows(keyframes_mask)
+        if found is not None:
+            start, stop, idx = found
+            # 標記列乘上 bf16 的 1.0 就是 embedding 本身，未標記列乘 0 後相加等於
+            # 原值，故只對標記列做加與原運算式逐位元相同。hidden_states 由
+            # patchify_proj 產生，沒有其他持有者，可就地更新。
+            flat = hidden_states.view(-1, hidden_states.shape[-1])
+            if idx is None:
+                flat[start:stop] += emb
+            else:
+                flat.index_add_(0, idx, emb.expand(idx.numel(), -1))
+            return hidden_states
     mask = (keyframes_mask > 0).to(dtype=hidden_states.dtype)
-    return hidden_states + mask * embedding.to(dtype=hidden_states.dtype)
+    return hidden_states + mask * emb
 
 
 @dataclass(frozen=True)

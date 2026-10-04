@@ -103,6 +103,84 @@ class PytorchAttention(AttentionCallable):
         return out
 
 
+# --- temporal window ----------------------------------------------------
+# 時間窗自注意力：把長序列切成連續幀，每幀只 attend 鄰近幀。token 索引為
+# ((f * H + h) * W + w)，同幀 token 為序列中的連續區塊。
+# 未設 LTX_ATTN_WINDOW（0）、或 LTX_ORIGINAL_PATH=1 時，AUTOMATIC 的挑選結果原樣回傳。
+_ATTN_WINDOW_ENV = "LTX_ATTN_WINDOW"
+_ATTN_FRAMES_ENV = "LTX_ATTN_FRAMES"
+_ATTN_MIN_TOKENS_ENV = "LTX_ATTN_MIN_TOKENS"
+
+
+def _env_int(name: str, default: int) -> int:
+    """讀取整數環境變數；未設或空字串回傳 default，非法值 raise ValueError。"""
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise ValueError("%s must be an integer, got %r" % (name, value)) from None
+    if parsed < 0:
+        raise ValueError("%s must be >= 0, got %d" % (name, parsed))
+    return parsed
+
+
+class PytorchWindowedAttention:
+    """時間窗自注意力包裝，呼叫介面同 :class:`AttentionCallable`。
+
+    window 為窗半徑（幀），frames 為序列的總幀數，min_tokens 為生效的最小序列長度。
+    僅在 mask 為 None、查詢與鍵等長、長度 >= min_tokens 且能整除 frames 時走時間窗；
+    其餘情形原樣轉呼叫 base。
+    """
+
+    def __init__(self, base: AttentionCallable, *, window: int, frames: int, min_tokens: int) -> None:
+        self._base = base
+        self._window = window
+        self._frames = frames
+        self._min_tokens = min_tokens
+
+    @property
+    def label(self) -> str:
+        return "%s+tw%d" % (attention_label(self._base), self._window)
+
+    def __call__(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int, mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        total = q.shape[1]
+        if mask is None and total == k.shape[1] and total >= self._min_tokens and total % self._frames == 0:
+            span = total // self._frames
+            outs = []
+            for f in range(self._frames):
+                lo = max(0, f - self._window)
+                hi = min(self._frames, f + self._window + 1)
+                outs.append(
+                    self._base(
+                        q[:, f * span:(f + 1) * span],
+                        k[:, lo * span:hi * span],
+                        v[:, lo * span:hi * span],
+                        heads,
+                    )
+                )
+            return torch.cat(outs, dim=1)
+        return self._base(q, k, v, heads, mask)
+
+
+def _windowed_attention(base: AttentionCallable) -> AttentionCallable:
+    """依 LTX_ATTN_WINDOW 包裝 base；未啟用時原樣回傳 base。"""
+    if os.environ.get("LTX_ORIGINAL_PATH", "0") == "1":
+        return base
+    window = _env_int(_ATTN_WINDOW_ENV, 0)
+    if window == 0:
+        return base
+    return PytorchWindowedAttention(
+        base,
+        window=window,
+        frames=_env_int(_ATTN_FRAMES_ENV, 16),
+        min_tokens=_env_int(_ATTN_MIN_TOKENS_ENV, 16384),
+    )
+
+
 class MPSSdpaAttention(AttentionCallable):
     """Apple-fused scaled-dot-product attention on MPS.
     Routes to ``mps_sdpa.sdpa_opt``, which calls Apple's prebuilt
@@ -240,18 +318,6 @@ _SDPA_FULL_PRIORITY: tuple[SDPBackend, ...] = (
 )
 
 
-def _r24_flash_backend() -> SDPBackend | None:
-    """Return the explicit transformer attention backend selected by the R24 flag."""
-    value = os.environ.get("LTX_R24_FLASH")
-    if value is None:
-        return None
-    if value not in ("0", "1"):
-        raise ValueError("LTX_R24_FLASH must be 0 or 1")
-    if os.environ.get("LTX_ALL_ORIG", "0") == "1":
-        return None
-    return SDPBackend.MATH if value == "0" else SDPBackend.FLASH_ATTENTION
-
-
 def _on_macos() -> bool:
     """True on macOS, where torch's native SDPA materializes the score matrix and
     AUTOMATIC routes to Apple's fused ``mps-sdpa`` kernel instead."""
@@ -294,9 +360,6 @@ def _select_primary_attention() -> AttentionCallable:
     - Everywhere else (Ada, Ampere, CPU): SDPA with the full backend priority
       list -- torch's runtime dispatcher picks the best fit at call time.
     """
-    explicit_backend = _r24_flash_backend()
-    if explicit_backend is not None:
-        return PytorchAttention(priority=[explicit_backend])
     if torch.cuda.is_available():
         major, _ = torch.cuda.get_device_capability(0)
         if major == 9:
@@ -317,11 +380,6 @@ def _select_masked_attention() -> MaskedAttentionCallable:
     Intel/CPU macs); else SDPA with the full priority list (the dispatcher
     rejects FLASH automatically when a mask is present and walks past it --
     torch SDPA handles the additive mask directly)."""
-    explicit_backend = _r24_flash_backend()
-    if explicit_backend is SDPBackend.MATH:
-        return PytorchAttention(priority=[SDPBackend.MATH])
-    if explicit_backend is SDPBackend.FLASH_ATTENTION:
-        return _sdpa_full_priority()
     if _on_macos():
         return MPSSdpaAttention() if _mps_sdpa_available() else _sdpa_full_priority()
     return _sdpa_full_priority()
@@ -392,7 +450,7 @@ class AttentionFunction(Enum):
         """
         match self:
             case AttentionFunction.AUTOMATIC:
-                return automatic_attention()
+                return _windowed_attention(automatic_attention())
             case AttentionFunction.PYTORCH:
                 return PytorchAttention()
             case AttentionFunction.FLASH_ATTENTION_3:
@@ -518,9 +576,9 @@ class Attention(torch.nn.Module):
         self.gated_attention_function = ops.gated_attention_function
 
         inner_dim = dim_head * heads
-        # R9B: capture self-ness at construction (post-load dim equality is
+        # Capture self-ness at construction (post-load dim equality is
         # ambiguous: cross-text context_dim can equal query_dim).
-        self._r9b_is_self = context_dim is None
+        self.is_self_attention = context_dim is None
         context_dim = query_dim if context_dim is None else context_dim
 
         self.heads = heads
@@ -580,7 +638,7 @@ class Attention(torch.nn.Module):
         context = x if context is None else context
         use_attention = not all_perturbed
 
-        # R9B fused projections (post-load hook installs to_qkv/to_kv).
+        # fused projections (post-load hook installs to_qkv/to_kv).
         if hasattr(self, "to_qkv"):
             q, k, v = self.to_qkv(x).chunk(3, dim=-1)
         elif hasattr(self, "to_kv"):

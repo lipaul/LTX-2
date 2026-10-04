@@ -18,7 +18,7 @@ against it before the artifact is used:
   online quantization, WARNING naming the drift and the regenerate command
 
 ``LTX_PREQUANT`` selects the artifact (``1`` by default, ``0`` forces the online
-path, any other value raises). ``LTX_ALL_ORIG=1`` forces the online path.
+path, any other value raises). ``LTX_ORIGINAL_PATH=1`` forces the online path.
 ``LTX_PREQUANT_VERIFY_SHA256=1`` additionally re-hashes the artifact and the
 source checkpoint at load time.
 """
@@ -75,7 +75,7 @@ class ProvenanceError(ValueError):
 
 def prequant_enabled() -> bool:
     """Whether the prequant artifact is selected (``LTX_PREQUANT``, default ``1``)."""
-    if os.environ.get("LTX_ALL_ORIG", "0") == "1":
+    if os.environ.get("LTX_ORIGINAL_PATH", "0") == "1":
         return False
     value = os.environ.get("LTX_PREQUANT", "1")
     if value not in {"0", "1"}:

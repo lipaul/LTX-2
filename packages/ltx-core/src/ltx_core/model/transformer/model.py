@@ -29,16 +29,16 @@ logger = logging.getLogger(__name__)
 
 
 def _env_on(name, default="1"):
-    # Central env helper: LTX_ALL_ORIG=1 forces round-0 (all fall back to original formulas).
-    if os.environ.get("LTX_ALL_ORIG", "0") == "1":
+    # Central env helper: LTX_ORIGINAL_PATH=1 routes every path back to plain torch ops.
+    if os.environ.get("LTX_ORIGINAL_PATH", "0") == "1":
         return False
     return os.environ.get(name, default) != "0"
 
 
-def _r31_compat_on():
-    # R31 output-audit compat: reproduce round-0 bf16 rounding at the fused
-    # R3/R6/R8/R10D sites. Default on; LTX_R31_COMPAT=0 falls back.
-    return _env_on("LTX_R31_COMPAT", "1")
+def _torch_exact_rounding_enabled():
+    # Whether the fused sites reproduce torch's bf16 rounding exactly; on by
+    # default. LTX_TORCH_EXACT_ROUNDING=0 keeps the fused rounding.
+    return _env_on("LTX_TORCH_EXACT_ROUNDING", "1")
 
 
 class LTXModelType(Enum):
@@ -499,10 +499,10 @@ class LTXModel(torch.nn.Module, Disposable):
         shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
 
         x = norm_out(x)
-        # T2 (AdaLN fusion): mul+add -> single addcmul kernel.
-        # LTX_R3_FUSE=0 (or LTX_ALL_ORIG=1) restores the original formula.
-        # R31 compat restores it too (round-0 rounding).
-        if not _env_on("LTX_R3_FUSE") or _r31_compat_on():
+        # AdaLN fusion: mul+add -> single addcmul kernel.
+        # LTX_FUSE_ADALN=0 (or LTX_ORIGINAL_PATH=1) uses the two-op formula,
+        # and so does compat mode, which needs torch's rounding points.
+        if not _env_on("LTX_FUSE_ADALN") or _torch_exact_rounding_enabled():
             x = x * (1 + scale) + shift
         else:
             x = torch.addcmul(shift, x, 1 + scale)
